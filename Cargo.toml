@@ -11,6 +11,7 @@ crossterm = { version = "0.25.0", features = ["event-stream"] }
 env_logger = "0.9.3"
 futures = "0.3.25"
 log = "0.4.17"
+quick-xml = { version = "0.26.0", features = ["serialize", "overlapped-lists"] }
 serde = { version = "1.0.147", features = ["derive"] }
 surf = "2.3.2"
 tui = "0.19.0"

@@ -1,60 +1,100 @@
 use serde::{Deserialize, Serialize};
 use surf::http::Method;
 
-#[derive(Deserialize)]
-pub struct Response {
+#[derive(Deserialize, Debug)]
+pub struct InspiresSearchResult {
     pub hits: Hits,
 }
 
-impl Response {
-    pub fn title(&self) -> Option<&str> {
-        self.hits
-            .hits
-            .iter()
-            .flat_map(|hit| hit.metadata.titles.iter())
-            .next()
-            .map(|title| &title.title[..])
-    }
-}
-
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug)]
 pub struct Hits {
     pub hits: Vec<NestedHit>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug)]
 pub struct NestedHit {
     pub metadata: Metadata,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug)]
 pub struct Metadata {
     pub titles: Vec<Title>,
+    pub arxiv_eprints: Vec<ArxivEprint>,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct ArxivEprint {
+    pub value: String,
 }
 
 impl Metadata {
     pub fn title(&self) -> Option<&str> {
         self.titles.get(0).map(|t| &t.title[..])
     }
+
+    pub fn eprint(&self) -> Option<&str> {
+        self.arxiv_eprints.get(0).map(|e| &e.value[..])
+    }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug)]
 pub struct Title {
     pub title: String,
 }
 
 #[derive(Serialize)]
-struct Query {
-    pub q: String,
+struct InspiresQuery {
+    q: String,
+    sort: &'static str,
+    size: u32,
 }
 
-pub async fn get(input: String) -> Result<Response, surf::Error> {
+#[derive(Serialize)]
+struct ArxivQuery {
+    id_list: String,
+}
+
+pub async fn search_inspires(input: String) -> Result<InspiresSearchResult, surf::Error> {
     let mut response = surf::RequestBuilder::new(
         Method::Get,
         "https://inspirehep.net/api/literature".try_into().unwrap(),
     )
-    .query(&Query { q: input })?
+    .query(&InspiresQuery {
+        q: input,
+        sort: "mostrecent",
+        size: 50,
+    })?
     .await?;
 
-    Ok(response.body_json::<Response>().await?)
+    Ok(response.body_json::<InspiresSearchResult>().await?)
+}
+
+#[derive(Deserialize, Debug)]
+pub struct ArxivSearchResult {
+    pub entry: Vec<ArxivEntry>,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct ArxivEntry {
+    pub id: String,
+    pub link: Vec<Link>,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct Link {
+    pub title: Option<String>,
+    pub href: String,
+}
+
+pub async fn get_preprint(id: String) -> surf::Result<ArxivSearchResult> {
+    let mut response = surf::RequestBuilder::new(
+        Method::Get,
+        "http://export.arxiv.org/api/query".try_into().unwrap(),
+    )
+    .query(&ArxivQuery { id_list: id })?
+    .await?;
+
+    let body = response.body_string().await?;
+    Ok(quick_xml::de::from_str(&body)?)
+    // Ok(response.body::<ArxivSearchResult>().await?)
 }
