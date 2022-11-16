@@ -70,6 +70,11 @@ fn main() -> anyhow::Result<()> {
         builder.init();
     }
 
+    if std::env::args_os().skip(1).next() == Some("--version".into()) {
+        println!("pneo {}", std::env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
     fn start_terminal() -> io::Result<Terminal<CrosstermBackend<impl Write>>> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
