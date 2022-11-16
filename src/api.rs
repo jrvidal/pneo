@@ -21,6 +21,13 @@ pub struct Metadata {
     pub titles: Vec<Title>,
     #[serde(default)]
     pub arxiv_eprints: Vec<ArxivEprint>,
+    #[serde(default)]
+    pub authors: Vec<Author>,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct Author {
+    pub last_name: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -31,6 +38,24 @@ pub struct ArxivEprint {
 impl Metadata {
     pub fn title(&self) -> Option<&str> {
         self.titles.get(0).map(|t| &t.title[..])
+    }
+
+    pub fn authors(&self) -> String {
+        let mut authors = String::new();
+
+        for author in &self.authors {
+            let Some(last_name) = &author.last_name else {
+                continue;
+            };
+
+            if !authors.is_empty() {
+                authors.push_str(", ");
+            }
+
+            authors.push_str(last_name);
+        }
+
+        authors
     }
 
     pub fn eprint(&self) -> Option<&str> {

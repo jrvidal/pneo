@@ -22,7 +22,7 @@ use std::{
 use tui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
-    widgets::{Block, Borders, List, ListItem},
+    widgets::{Block, Borders, Row, Table},
     Terminal,
 };
 
@@ -329,6 +329,8 @@ fn main_loop<B: tui::backend::Backend>(
                 }
             }
             Message::SearchResponse(res) => {
+                log::debug!("search response {:?}", res);
+
                 state.focus = 0;
                 state.output = Some(
                     res.map(|res| res.hits.hits.into_iter().map(|hit| hit.metadata).collect()),
@@ -516,26 +518,31 @@ fn ui<'t, 's, B: tui::backend::Backend>(
                 focus = space - 1;
             }
 
-            let items = results
+            let rows = results
                 .iter()
                 .skip(offset)
                 .take(space as usize)
-                .map(|metadata| metadata.title().unwrap_or("(No title)"))
                 .enumerate()
-                .map(|(i, title)| {
-                    ListItem::new(format!(
-                        "{} {}",
-                        if !state.busy() && i == focus {
-                            ">"
-                        } else {
-                            " "
-                        },
-                        title
-                    ))
+                .map(|(i, metadata)| {
+                    Row::new(vec![
+                        format!(
+                            "{} {}",
+                            if !state.busy() && i == focus {
+                                ">"
+                            } else {
+                                " "
+                            },
+                            metadata.title().unwrap_or("(No title)")
+                        ),
+                        metadata.authors(),
+                    ])
                 })
                 .collect::<Vec<_>>();
 
-            f.render_widget(List::new(items), results_chunk);
+            f.render_widget(
+                Table::new(rows).widths(&[Constraint::Percentage(70), Constraint::Percentage(30)]),
+                results_chunk,
+            );
         }
     })
 }
