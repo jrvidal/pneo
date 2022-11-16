@@ -5,11 +5,11 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use futures::{
-    future::{Fuse, FusedFuture},
+    future::{Fuse, FusedFuture, OptionFuture},
     stream::{self, FusedStream},
     Future, FutureExt, StreamExt,
 };
-use std::{io, panic::AssertUnwindSafe, pin::Pin, task::Poll, time::Duration};
+use std::{io, panic::AssertUnwindSafe, pin::Pin, process::Command, task::Poll, time::Duration};
 use tui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
@@ -17,7 +17,7 @@ use tui::{
     Terminal,
 };
 
-use crate::api::InspiresSearchResult;
+use crate::api::{ArxivSearchResult, InspiresSearchResult};
 
 mod api;
 
@@ -31,9 +31,6 @@ fn main() -> Result<(), io::Error> {
 
         builder.init();
     }
-
-    // async_std::task::block_on(async { api::get_preprint("hep-ph/0009092".to_string()).await })
-    //     .unwrap();
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -76,40 +73,60 @@ fn main() -> Result<(), io::Error> {
 struct State {
     input: String,
     output: Option<surf::Result<Vec<Metadata>>>,
-    spinner: u8,
+    searching: bool,
+    fetching: bool,
     focus: u8,
 }
 
+impl State {
+    fn busy(&self) -> bool {
+        self.searching || self.fetching
+    }
+}
+
 fn main_loop<B: tui::backend::Backend>(terminal: &mut Terminal<B>) -> Result<(), io::Error> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap();
+
+    let _guard = runtime.enter();
+
     let mut state = State {
         input: String::new(),
         output: None,
-        spinner: 0,
+        searching: false,
+        fetching: false,
         focus: 0,
     };
 
-    let request = Fuse::terminated();
-    futures::pin_mut!(request);
+    let mut spinner_state = SpinnerState::new();
+
     let mut draw = true;
 
+    let search_request = Fuse::terminated();
+    let preprint_request = Fuse::terminated();
+    let download_request = Fuse::terminated();
     let mut event_stream = EventStream::new().fuse();
-
-    let mut spinner_ticks: Pin<Box<dyn FusedStream<Item = ()>>> = Box::pin(stream::empty());
     let throttle = Fuse::terminated();
+    futures::pin_mut!(search_request);
+    futures::pin_mut!(preprint_request);
+    futures::pin_mut!(download_request);
     futures::pin_mut!(throttle);
-
     loop {
-        log::debug!("drawing!");
+        spinner_state.spin(state.busy());
         if draw {
-            ui(terminal, &state)?;
-            log::debug!("drawed!");
+            log::debug!("drawing!");
+            ui(terminal, &state, &spinner_state)?;
         }
 
         draw = true;
 
         enum Message {
             Event(Option<Result<Event, io::Error>>),
-            Response(surf::Result<InspiresSearchResult>),
+            SearchResponse(surf::Result<InspiresSearchResult>),
+            PreprintResponse(surf::Result<ArxivSearchResult>),
+            Downloaded(String),
             Spin,
             Commit,
         }
@@ -117,7 +134,9 @@ fn main_loop<B: tui::backend::Backend>(terminal: &mut Terminal<B>) -> Result<(),
         #[derive(Debug)]
         enum MessageDebug<'a> {
             Event(Option<&'a Event>),
-            Response(&'a surf::Result<InspiresSearchResult>),
+            SearchResponse(&'a surf::Result<InspiresSearchResult>),
+            PreprintResponse(&'a surf::Result<ArxivSearchResult>),
+            Downloaded(&'a String),
             Spin,
             Commit,
         }
@@ -128,7 +147,9 @@ fn main_loop<B: tui::backend::Backend>(terminal: &mut Terminal<B>) -> Result<(),
                     Message::Event(event) => {
                         MessageDebug::Event(event.as_ref().and_then(|ev| ev.as_ref().ok()))
                     }
-                    Message::Response(res) => MessageDebug::Response(res),
+                    Message::SearchResponse(res) => MessageDebug::SearchResponse(res),
+                    Message::PreprintResponse(res) => MessageDebug::PreprintResponse(res),
+                    Message::Downloaded(res) => MessageDebug::Downloaded(res),
                     Message::Spin => MessageDebug::Spin,
                     Message::Commit => MessageDebug::Commit,
                 }
@@ -142,12 +163,16 @@ fn main_loop<B: tui::backend::Backend>(terminal: &mut Terminal<B>) -> Result<(),
         }
 
         log::debug!("next message...");
-        let message = async_std::task::block_on(async {
+        let message = runtime.block_on(async {
+            let mut spin = spinner_state.stream();
+
             futures::select! {
-                ev = InspectPoll{ fut: event_stream.next(), name: "event"} => Message::Event(ev),
-                res = InspectPoll {fut: &mut request, name: "request" }=> Message::Response(res),
-                _ = InspectPoll { fut: spinner_ticks.next() , name: "spin"} => Message::Spin,
-                _ = InspectPoll {fut: &mut throttle, name: "commit"} => Message::Commit,
+                ev =  event_stream.next() => Message::Event(ev),
+                res =  &mut search_request => Message::SearchResponse(res),
+                _ =  spin.next() => Message::Spin,
+                _ =  &mut throttle => Message::Commit,
+                preprint = &mut preprint_request => Message::PreprintResponse(preprint),
+                download = &mut download_request => Message::Downloaded(download),
             }
         });
 
@@ -157,34 +182,54 @@ fn main_loop<B: tui::backend::Backend>(terminal: &mut Terminal<B>) -> Result<(),
             Message::Event(None) => return Ok(()),
             Message::Event(Some(ev)) => {
                 draw = false;
-                let input_changed = match ev? {
+                enum Action {
+                    Input,
+                    Select,
+                }
+
+                let action = match ev? {
                     Event::Key(key) => match key.code {
                         KeyCode::Esc => return Ok(()),
                         KeyCode::Char(ch) => {
-                            state.input.push(ch);
-                            true
+                            if !state.fetching {
+                                state.input.push(ch);
+                                Some(Action::Input)
+                            } else {
+                                continue;
+                            }
                         }
                         KeyCode::Enter => {
-                            state.input.push('\n');
-                            true
+                            if state.busy() {
+                                continue;
+                            } else {
+                                Some(Action::Select)
+                            }
                         }
                         KeyCode::Delete | KeyCode::Backspace => {
                             state.input.pop();
-                            true
+                            Some(Action::Input)
                         }
                         KeyCode::Down => {
+                            if state.busy() {
+                                continue;
+                            }
+
                             if let Some(Ok(entries)) = &state.output {
                                 if !entries.is_empty() {
                                     state.focus = (state.focus + 1).min((entries.len() - 1) as u8);
                                 }
                             }
-                            false
+                            None
                         }
                         KeyCode::Up => {
+                            if state.busy() {
+                                continue;
+                            }
+
                             if let Some(Ok(_)) = &state.output {
                                 state.focus = state.focus.saturating_sub(1);
                             }
-                            false
+                            None
                         }
                         _ => continue,
                     },
@@ -193,52 +238,105 @@ fn main_loop<B: tui::backend::Backend>(terminal: &mut Terminal<B>) -> Result<(),
 
                 draw = true;
 
-                if !input_changed {
+                let Some(action) = action else {
                     continue;
+                };
+
+                match action {
+                    Action::Input => {
+                        search_request.set(Fuse::terminated());
+                        throttle.set(tick(400).fuse());
+                        state.searching = true;
+                    }
+                    Action::Select => {
+                        let preprint_id = state
+                            .output
+                            .as_ref()
+                            .and_then(|res| res.as_ref().ok())
+                            .and_then(|entries| entries.get(state.focus as usize))
+                            .and_then(|entry| entry.eprint());
+
+                        log::debug!("Preprint {:?}", preprint_id);
+                        if let Some(preprint_id) = preprint_id {
+                            state.fetching = true;
+                            preprint_request.set(api::get_preprint(preprint_id.to_string()).fuse());
+                        }
+                    }
                 }
-
-                request.set(Fuse::terminated());
-
-                throttle.set(tick(400).fuse());
-                spinner_ticks = Box::pin(ticks(75).fuse());
-                // next_spin = Some(spinner_ticks.as_mut().unwrap().next()).into();
             }
-            Message::Response(res) => {
+            Message::SearchResponse(res) => {
+                state.focus = 0;
                 state.output = Some(
                     res.map(|res| res.hits.hits.into_iter().map(|hit| hit.metadata).collect()),
                 );
-                request.set(Fuse::terminated());
 
-                spinner_ticks = Box::pin(stream::empty());
-                state.spinner = 0;
-                state.focus = 0;
+                state.searching = false;
+            }
+            Message::PreprintResponse(res) => {
+                let link = res
+                    .ok()
+                    .into_iter()
+                    .flat_map(|result| result.entry.into_iter())
+                    .flat_map(|entry| entry.link.into_iter())
+                    .filter(|link| link.title.as_deref() == Some("pdf"))
+                    .next();
+
+                let Some(link) = link else {
+                    state.fetching = false;
+                    continue;
+                };
+
+                let url = link.href;
+                let path = { url.rsplit_once("/").unwrap().1.to_string() };
+
+                if std::path::Path::new(&path).exists() {
+                    state.fetching = false;
+                    Command::new("xdg-open").arg(path).spawn();
+                    continue;
+                }
+
+                download_request.set(
+                    surf::Client::new()
+                        .with(surf::middleware::Redirect::default())
+                        .get(url.clone())
+                        .then(|res| {
+                            OptionFuture::from(res.ok().map(|mut res| res.take_body().into_bytes()))
+                        })
+                        .map(|result| result.map(|res| res.ok()).flatten())
+                        .map({
+                            let path = path.clone();
+                            move |bytes| {
+                                bytes.into_iter().for_each(|content| {
+                                    std::fs::write(&path, content);
+                                })
+                            }
+                        })
+                        .map(|_| path)
+                        .fuse(),
+                )
             }
             Message::Spin => {
-                // next_spin = Some(spinner_ticks.as_mut().unwrap().next()).into();
-                state.spinner += 1;
-
-                if state.spinner % 4 == 1 {
-                    state.spinner = 1;
-                }
+                spinner_state.tick();
             }
             Message::Commit => {
-                throttle.set(Fuse::terminated());
-
                 if state.input.len() < 3 {
-                    // next_spin = None.into();
-                    spinner_ticks = Box::pin(stream::empty());
+                    state.searching = false;
                     continue;
                 }
 
                 log::info!("requesting with {:?}", &state.input);
-                request.set(api::search_inspires(state.input.clone()).fuse());
+                search_request.set(api::search_inspires(state.input.clone()).fuse());
+            }
+            Message::Downloaded(path) => {
+                state.fetching = false;
+                Command::new("xdg-open").arg(path).spawn();
             }
         }
     }
 }
 
 fn tick(millis: u64) -> impl Future<Output = ()> {
-    async_std::task::sleep(Duration::from_millis(millis))
+    tokio::time::sleep(Duration::from_millis(millis))
 }
 
 fn ticks(millis: u64) -> impl futures::Stream<Item = ()> {
@@ -274,92 +372,10 @@ impl<F: FusedFuture> FusedFuture for InspectPoll<F> {
     }
 }
 
-struct MyFusedFuture<F> {
-    fut: Option<F>,
-}
-
-impl<F> MyFusedFuture<F> {
-    fn as_mut(&mut self) -> MyFusedFuture<&mut F> {
-        MyFusedFuture {
-            fut: self.fut.as_mut(),
-        }
-    }
-
-    // unsafe fn pin_mut(&mut self) -> Pin<&mut Self> {
-    //     unsafe { Pin::new_unchecked(&mut self) }
-    // }
-
-    fn as_pin_mut(self: Pin<&mut Self>) -> MyFusedFuture<Pin<&mut F>> {
-        let this = unsafe { self.get_unchecked_mut() };
-        let projection = unsafe { Pin::new_unchecked(&mut this.fut) };
-
-        MyFusedFuture {
-            fut: projection.as_pin_mut(),
-        }
-
-        // match this {
-        //     Some(fut) => MyFusedFuture {
-        //         fut: Some(unsafe { Pin::new_unchecked(fut) }),
-        //     },
-        //     None => MyFusedFuture { fut: None },
-        // }
-        // match &mut this.fut {
-        //     Some(fut) => unsafe { Pin::new_unchecked(fut) },
-        //     None => MyFusedFuture { fut: None },
-        // };
-
-        // if poll.is_ready() {
-        //     this.fut = None;
-        // }
-
-        // poll
-    }
-}
-
-impl<F> From<Option<F>> for MyFusedFuture<F> {
-    fn from(fut: Option<F>) -> Self {
-        MyFusedFuture { fut }
-    }
-}
-
-impl<F: Future> Future for MyFusedFuture<F> {
-    type Output = F::Output;
-
-    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
-        let this = unsafe { self.get_unchecked_mut() };
-        let poll = match &mut this.fut {
-            Some(fut) => unsafe { Pin::new_unchecked(fut) }.poll(cx),
-            None => Poll::Pending,
-        };
-
-        if poll.is_ready() {
-            this.fut = None;
-        }
-
-        poll
-    }
-}
-
-// impl<F: Unpin> Unpin for MyFusedFuture<F> {}
-
-impl<F: Future> FusedFuture for MyFusedFuture<F> {
-    fn is_terminated(&self) -> bool {
-        self.fut.is_none()
-    }
-}
-
-async fn maybe_stream<S: futures::Stream + Unpin>(
-    stream: Option<S>,
-) -> Option<<S as futures::Stream>::Item> {
-    match stream {
-        Some(mut stream) => stream.next().await,
-        None => futures::future::pending().await,
-    }
-}
-
 fn ui<'t, 's, B: tui::backend::Backend>(
     terminal: &'t mut Terminal<B>,
     state: &'s State,
+    spinner: &'s SpinnerState,
 ) -> Result<tui::terminal::CompletedFrame<'t>, io::Error> {
     terminal.draw(|f| {
         let size = f.size();
@@ -385,13 +401,10 @@ fn ui<'t, 's, B: tui::backend::Backend>(
         text_chunk.width -= 5;
         f.render_widget(Block::default().title(state.input.clone()), text_chunk);
 
-        let icon = ["|", "/", "-", "\\"][(state.spinner % 4) as usize];
+        // let icon = ["|", "/", "-", "\\"][(state.spinner % 4) as usize];
         text_chunk.x -= 3;
         text_chunk.width = 4;
-        f.render_widget(
-            Block::default().title(if state.spinner == 0 { " " } else { icon }),
-            text_chunk,
-        );
+        f.render_widget(Block::default().title(spinner.icon()), text_chunk);
 
         let message_chunk = Layout::default()
             .margin(1)
@@ -434,11 +447,68 @@ fn ui<'t, 's, B: tui::backend::Backend>(
                 .map(|metadata| metadata.title().unwrap_or("(No title)"))
                 .enumerate()
                 .map(|(i, title)| {
-                    ListItem::new(format!("{} {}", if i == focus { ">" } else { " " }, title))
+                    ListItem::new(format!(
+                        "{} {}",
+                        if !state.busy() && i == focus {
+                            ">"
+                        } else {
+                            " "
+                        },
+                        title
+                    ))
                 })
                 .collect::<Vec<_>>();
 
             f.render_widget(List::new(items), results_chunk);
         }
     })
+}
+
+struct SpinnerState {
+    spinning: bool,
+    frame: u8,
+    stream: Pin<Box<dyn FusedStream<Item = ()>>>,
+}
+
+impl SpinnerState {
+    fn new() -> Self {
+        Self {
+            spinning: false,
+            frame: 0,
+            stream: Box::pin(stream::empty()),
+        }
+    }
+
+    fn spin(&mut self, spin: bool) {
+        let was_spinning = self.spinning;
+        self.spinning = spin;
+
+        match (was_spinning, self.spinning) {
+            (false, true) => {
+                self.stream = Box::pin(ticks(45).fuse());
+                self.frame = 0;
+            }
+            (true, false) => {
+                self.stream = Box::pin(stream::empty());
+            }
+            _ => {}
+        }
+    }
+
+    fn tick(&mut self) {
+        self.frame += 1;
+        self.frame %= 4;
+    }
+
+    fn stream(&mut self) -> impl FusedStream + '_ {
+        &mut self.stream
+    }
+
+    fn icon(&self) -> &str {
+        if !self.spinning {
+            " "
+        } else {
+            ["|", "/", "-", "\\"][(self.frame % 4) as usize]
+        }
+    }
 }

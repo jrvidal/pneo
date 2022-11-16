@@ -19,6 +19,7 @@ pub struct NestedHit {
 #[derive(Deserialize, Debug)]
 pub struct Metadata {
     pub titles: Vec<Title>,
+    #[serde(default)]
     pub arxiv_eprints: Vec<ArxivEprint>,
 }
 
@@ -96,5 +97,4 @@ pub async fn get_preprint(id: String) -> surf::Result<ArxivSearchResult> {
 
     let body = response.body_string().await?;
     Ok(quick_xml::de::from_str(&body)?)
-    // Ok(response.body::<ArxivSearchResult>().await?)
 }
