@@ -1,0 +1,50 @@
+name: 'Release pneo binary'
+
+on:
+  push:
+    branches:
+      - master
+
+jobs:
+  compile-and-release:
+    runs-on: ubuntu-latest
+    container: rust:1.65
+    steps:
+      - uses: actions/checkout@v3
+
+      - uses: actions/cache@v3
+        with:
+          key: cargo-index-v1
+          path: |
+            /usr/local/cargo/registry/index
+
+      - uses: actions/cache@v3
+        with:
+          key: cargo-registry-v1-${{ hashFiles('Cargo.lock') }}
+          path: |
+            /usr/local/cargo/registry/cache
+            /usr/local/cargo/git/db
+
+      - name: Compile project
+        run: cargo build --release --locked
+
+      - uses: actions/github-script@v6
+        name: Create release
+        with:
+          script: |
+            const fs = require('fs');
+            const version = fs.readFileSync('Cargo.toml', 'utf8').match(/^ *version *= *"(.*)" *$/m)[1];
+
+            const release = await github.rest.repos.createRelease({
+              owner: 'jrvidal',
+              repo: 'pneo',
+              tag_name: `${version}-${context.sha.slice(0, 6)}`
+            });
+
+            await github.rest.repos.uploadReleaseAsset({
+              release_id: release.data.id,
+              owner: 'jrvidal',
+              repo: 'pneo',
+              data: fs.readFileSync('target/release/pneo'),
+              name: 'pneo'
+            });
