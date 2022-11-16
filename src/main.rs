@@ -1,3 +1,4 @@
+use anyhow::Context;
 use api::Metadata;
 
 use crossterm::{
@@ -9,7 +10,15 @@ use futures::{
     stream::{self, FusedStream},
     Future, FutureExt, StreamExt,
 };
-use std::{io, panic::AssertUnwindSafe, pin::Pin, process::Command, task::Poll, time::Duration};
+use std::{
+    io::{self, Write},
+    panic::AssertUnwindSafe,
+    path::PathBuf,
+    pin::Pin,
+    process::Command,
+    task::Poll,
+    time::Duration,
+};
 use tui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
@@ -21,36 +30,83 @@ use crate::api::{ArxivSearchResult, InspiresSearchResult};
 
 mod api;
 
-fn main() -> Result<(), io::Error> {
+fn main() -> anyhow::Result<()> {
+    let dir = {
+        let mut dir = dirs::config_dir().ok_or(io::Error::new(
+            io::ErrorKind::Other,
+            "unable to find config directory",
+        ))?;
+
+        dir.push("pneo");
+
+        dir
+    };
+
+    let cache = {
+        let mut cache = dir.clone();
+        cache.push("cache");
+        cache
+    };
+
+    std::fs::create_dir_all(&dir)
+        .context(format!("Unable to create config directory at {:?}", dir))?;
+    std::fs::create_dir_all(&cache)
+        .context(format!("Unable to create cache directory at {:?}", cache))?;
+
     {
         let mut builder = env_logger::Builder::from_default_env();
+        let logfile = {
+            let mut logfile = dir.clone();
+            logfile.push("pneo.log");
+            logfile
+        };
 
-        builder.target(env_logger::Target::Pipe(Box::new(
-            std::fs::File::create("pneo.log").unwrap(),
-        )));
+        builder
+            .filter_level(log::LevelFilter::Warn)
+            .target(env_logger::Target::Pipe(Box::new(
+                std::fs::File::create(logfile).context("Unable to create logfile")?,
+            )));
 
         builder.init();
     }
 
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    crossterm::execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
+    fn start_terminal() -> io::Result<Terminal<CrosstermBackend<impl Write>>> {
+        enable_raw_mode()?;
+        let mut stdout = io::stdout();
+        crossterm::execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+        let backend = CrosstermBackend::new(stdout);
+        let terminal = Terminal::new(backend)?;
+        Ok(terminal)
+    }
+
+    let mut terminal = match start_terminal().context("unable to start terminal interface") {
+        Err(e) => {
+            log::debug!("{:?}", e);
+            Err(e)
+        }
+        res => res,
+    }?;
 
     let assert = AssertUnwindSafe(&mut terminal);
     let result = std::panic::catch_unwind(|| {
         let mut assert = assert;
-        main_loop(&mut assert.0)
+        main_loop(&mut assert.0, cache)
     });
 
-    disable_raw_mode()?;
-    crossterm::execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )?;
-    terminal.show_cursor()?;
+    fn stop_terminal(mut terminal: Terminal<CrosstermBackend<impl Write>>) -> io::Result<()> {
+        disable_raw_mode()?;
+        crossterm::execute!(
+            terminal.backend_mut(),
+            LeaveAlternateScreen,
+            DisableMouseCapture
+        )?;
+        terminal.show_cursor()?;
+        Ok(())
+    }
+
+    if let Err(e) = stop_terminal(terminal).context("unable to restore terminal") {
+        log::debug!("{:?}", e);
+    }
 
     match result {
         Ok(result) => result,
@@ -84,11 +140,14 @@ impl State {
     }
 }
 
-fn main_loop<B: tui::backend::Backend>(terminal: &mut Terminal<B>) -> Result<(), io::Error> {
+fn main_loop<B: tui::backend::Backend>(
+    terminal: &mut Terminal<B>,
+    cache: PathBuf,
+) -> anyhow::Result<()> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_time()
         .build()
-        .unwrap();
+        .context("unable to start runtime")?;
 
     let _guard = runtime.enter();
 
@@ -126,7 +185,7 @@ fn main_loop<B: tui::backend::Backend>(terminal: &mut Terminal<B>) -> Result<(),
             Event(Option<Result<Event, io::Error>>),
             SearchResponse(surf::Result<InspiresSearchResult>),
             PreprintResponse(surf::Result<ArxivSearchResult>),
-            Downloaded(String),
+            Downloaded(PathBuf),
             Spin,
             Commit,
         }
@@ -136,7 +195,7 @@ fn main_loop<B: tui::backend::Backend>(terminal: &mut Terminal<B>) -> Result<(),
             Event(Option<&'a Event>),
             SearchResponse(&'a surf::Result<InspiresSearchResult>),
             PreprintResponse(&'a surf::Result<ArxivSearchResult>),
-            Downloaded(&'a String),
+            Downloaded(&'a PathBuf),
             Spin,
             Commit,
         }
@@ -287,10 +346,20 @@ fn main_loop<B: tui::backend::Backend>(terminal: &mut Terminal<B>) -> Result<(),
                 };
 
                 let url = link.href;
-                let path = { url.rsplit_once("/").unwrap().1.to_string() };
+                let path = {
+                    let mut path = cache.clone();
+                    let path_id = url
+                        .rsplit_once("/")
+                        // FIXME: handle
+                        .ok_or(anyhow::anyhow!("unexpected arxiv id {:?}", url))?
+                        .1;
+                    path.push(path_id);
+                    path
+                };
 
                 if std::path::Path::new(&path).exists() {
                     state.fetching = false;
+                    // FIXME: handle
                     Command::new("xdg-open").arg(path).spawn();
                     continue;
                 }
@@ -307,6 +376,7 @@ fn main_loop<B: tui::backend::Backend>(terminal: &mut Terminal<B>) -> Result<(),
                             let path = path.clone();
                             move |bytes| {
                                 bytes.into_iter().for_each(|content| {
+                                    // FIXME: handle
                                     std::fs::write(&path, content);
                                 })
                             }
@@ -329,6 +399,7 @@ fn main_loop<B: tui::backend::Backend>(terminal: &mut Terminal<B>) -> Result<(),
             }
             Message::Downloaded(path) => {
                 state.fetching = false;
+                // FIXME: handle
                 Command::new("xdg-open").arg(path).spawn();
             }
         }
