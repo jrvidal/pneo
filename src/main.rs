@@ -164,6 +164,8 @@ fn main_loop<B: tui::backend::Backend>(
         focus: 0,
     };
 
+    let mut ui_state = UiState { offset: 0 };
+
     let mut spinner_state = SpinnerState::new();
 
     let mut draw = true;
@@ -181,7 +183,7 @@ fn main_loop<B: tui::backend::Backend>(
         spinner_state.spin(state.busy());
         if draw {
             log::debug!("drawing!");
-            ui(terminal, &state, &spinner_state)?;
+            ui(terminal, &state, &mut ui_state, &spinner_state)?;
         }
 
         draw = true;
@@ -252,6 +254,10 @@ fn main_loop<B: tui::backend::Backend>(
                 }
 
                 let action = match ev? {
+                    Event::Resize(..) => {
+                        draw = true;
+                        continue;
+                    }
                     Event::Key(key) => match key.code {
                         KeyCode::Esc => return Ok(()),
                         KeyCode::Char(ch) => {
@@ -273,25 +279,28 @@ fn main_loop<B: tui::backend::Backend>(
                             state.input.pop();
                             Some(Action::Input)
                         }
-                        KeyCode::Down => {
+                        key @ (KeyCode::Down | KeyCode::PageDown) => {
                             if state.busy() {
                                 continue;
                             }
 
                             if let Some(Ok(entries)) = &state.output {
                                 if !entries.is_empty() {
-                                    state.focus = (state.focus + 1).min((entries.len() - 1) as u8);
+                                    let step = if key == KeyCode::Down { 1 } else { 10 };
+                                    state.focus =
+                                        (state.focus + step).min((entries.len() - 1) as u8);
                                 }
                             }
                             None
                         }
-                        KeyCode::Up => {
+                        key @ (KeyCode::Up | KeyCode::PageUp) => {
                             if state.busy() {
                                 continue;
                             }
 
                             if let Some(Ok(_)) = &state.output {
-                                state.focus = state.focus.saturating_sub(1);
+                                let step = if key == KeyCode::Up { 1 } else { 10 };
+                                state.focus = state.focus.saturating_sub(step);
                             }
                             None
                         }
@@ -450,9 +459,14 @@ impl<F: FusedFuture> FusedFuture for InspectPoll<F> {
     }
 }
 
+struct UiState {
+    offset: u8,
+}
+
 fn ui<'t, 's, B: tui::backend::Backend>(
     terminal: &'t mut Terminal<B>,
     state: &'s State,
+    ui_state: &'s mut UiState,
     spinner: &'s SpinnerState,
 ) -> Result<tui::terminal::CompletedFrame<'t>, io::Error> {
     terminal.draw(|f| {
@@ -509,25 +523,30 @@ fn ui<'t, 's, B: tui::backend::Backend>(
         };
 
         if let Some(results) = results {
-            let space = results_chunk.height as usize;
-            let mut focus = state.focus as usize;
-            let mut offset = 0;
+            let space = results_chunk.height as isize;
+            let mut offset = ui_state.offset as isize;
+            let mut focus_index = (state.focus as isize) - offset;
 
-            if (focus + 1) > space {
-                offset = focus + 1 - space;
-                focus = space - 1;
+            if (focus_index + 1) > space {
+                offset += focus_index + 1 - space;
+                focus_index = space - 1;
+            } else if focus_index < 0 {
+                offset += focus_index;
+                focus_index = 0;
             }
+
+            ui_state.offset = offset as u8;
 
             let rows = results
                 .iter()
-                .skip(offset)
+                .skip(offset as usize)
                 .take(space as usize)
                 .enumerate()
                 .map(|(i, metadata)| {
                     Row::new(vec![
                         format!(
                             "{} {}",
-                            if !state.busy() && i == focus {
+                            if !state.busy() && i == focus_index as usize {
                                 ">"
                             } else {
                                 " "
