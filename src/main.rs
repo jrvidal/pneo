@@ -21,7 +21,7 @@ use std::{
 };
 use tui::{
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout},
+    layout::{Constraint, Direction, Layout, Margin},
     style::{Color, Modifier, Style},
     text::Span,
     widgets::{Block, Borders, Row, Table},
@@ -146,6 +146,7 @@ struct State {
     output: Option<surf::Result<TableState<Metadata>>>,
     searching: bool,
     fetching: bool,
+    warning: Option<String>,
 }
 
 impl State {
@@ -232,6 +233,7 @@ fn main_loop<B: tui::backend::Backend>(
         output: None,
         searching: false,
         fetching: false,
+        warning: None,
     };
 
     let mut spinner_state = SpinnerState::new();
@@ -345,7 +347,13 @@ fn main_loop<B: tui::backend::Backend>(
                         _ => continue,
                     },
                     Event::Key(key) => match key.code {
-                        KeyCode::Esc => return Ok(()),
+                        KeyCode::Esc => {
+                            if state.warning.take().is_none() {
+                                return Ok(());
+                            } else {
+                                None
+                            }
+                        }
                         KeyCode::Char(ch) => {
                             if !state.fetching {
                                 state.append(ch);
@@ -408,17 +416,26 @@ fn main_loop<B: tui::backend::Backend>(
                         state.searching = true;
                     }
                     Action::Select => {
-                        let preprint_id = state
+                        let Some(table) = state
                             .output
                             .as_ref()
-                            .and_then(|res| res.as_ref().ok())
-                            .and_then(|table| table.entries.get(table.focus as usize))
-                            .and_then(|entry| entry.eprint());
+                            .and_then(|res| res.as_ref().ok()) else {
+                                draw = false;
+                                continue;
+                            };
+
+                        let entry = table.entries.get(table.focus as usize);
+
+                        let preprint_id = entry.and_then(|entry| entry.eprint());
 
                         log::debug!("Preprint {:?}", preprint_id);
+
                         if let Some(preprint_id) = preprint_id {
                             state.fetching = true;
                             preprint_request.set(api::get_preprint(preprint_id.to_string()).fuse());
+                        } else {
+                            log::warn!("unable to find preprint link for {:?}", entry);
+                            state.warning = Some(format!("Unable to find preprint link"));
                         }
                     }
                 }
@@ -734,6 +751,47 @@ fn ui<'t, 's, B: tui::backend::Backend>(
                 Table::new(rows).widths(&[Constraint::Percentage(70), Constraint::Percentage(30)]),
                 results_chunk,
             );
+
+            if let Some(warning) = &state.warning {
+                let chunks = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints(
+                        [
+                            Constraint::Percentage(33),
+                            Constraint::Percentage(33),
+                            Constraint::Min(0),
+                        ]
+                        .as_ref(),
+                    )
+                    .split(size);
+
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints(
+                        [
+                            Constraint::Percentage(30),
+                            Constraint::Percentage(40),
+                            Constraint::Min(0),
+                        ]
+                        .as_ref(),
+                    )
+                    .split(chunks[1]);
+
+                let warning_block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(tui::widgets::BorderType::Double)
+                    .border_style(Style::default().bg(Color::LightRed));
+
+                f.render_widget(tui::widgets::Clear, chunks[1]);
+                f.render_widget(warning_block, chunks[1]);
+
+                let message_chunk = chunks[1].inner(&Margin {
+                    // log::warn!("unable to find preprint link for {:?}", )
+                    vertical: 3,
+                    horizontal: 3,
+                });
+                f.render_widget(Block::default().title(&warning[..]), message_chunk);
+            }
         }
     })
 }
