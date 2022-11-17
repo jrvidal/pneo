@@ -22,6 +22,8 @@ use std::{
 use tui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
+    style::{Color, Modifier, Style},
+    text::Span,
     widgets::{Block, Borders, Row, Table},
     Terminal,
 };
@@ -140,11 +142,9 @@ fn main() -> anyhow::Result<()> {
 
 struct State {
     input: String,
-    output: Option<surf::Result<Vec<Metadata>>>,
+    output: Option<surf::Result<TableState<Metadata>>>,
     searching: bool,
     fetching: bool,
-    focus: u8,
-    blink: bool,
 }
 
 impl State {
@@ -157,16 +157,11 @@ impl State {
             return false;
         }
 
-        let Some(Ok(entries)) = &self.output else {
+        let Some(Ok(table)) = &mut self.output else {
             return false;
         };
 
-        if !entries.is_empty() {
-            self.focus = (self.focus + step).min((entries.len() - 1) as u8);
-            true
-        } else {
-            false
-        }
+        table.down(step)
     }
 
     fn up(&mut self, step: u8) -> bool {
@@ -174,16 +169,11 @@ impl State {
             return false;
         }
 
-        let Some(Ok(entries)) = &self.output else {
+        let Some(Ok(table)) = &mut self.output else {
             return false;
         };
 
-        if !entries.is_empty() {
-            self.focus = self.focus.saturating_sub(step);
-            true
-        } else {
-            false
-        }
+        table.up(step)
     }
 }
 
@@ -203,11 +193,7 @@ fn main_loop<B: tui::backend::Backend>(
         output: None,
         searching: false,
         fetching: false,
-        focus: 0,
-        blink: false,
     };
-
-    let mut ui_state = UiState { offset: 0 };
 
     let mut spinner_state = SpinnerState::new();
 
@@ -218,18 +204,16 @@ fn main_loop<B: tui::backend::Backend>(
     let download_request = Fuse::terminated();
     let mut event_stream = EventStream::new().fuse();
     let throttle = Fuse::terminated();
-    let blink = ticks(600).fuse();
     futures::pin_mut!(search_request);
     futures::pin_mut!(preprint_request);
     futures::pin_mut!(download_request);
     futures::pin_mut!(throttle);
-    futures::pin_mut!(blink);
 
     loop {
         spinner_state.spin(state.busy());
         if draw {
             log::debug!("drawing!");
-            ui(terminal, &state, &mut ui_state, &spinner_state)?;
+            ui(terminal, &mut state, &spinner_state)?;
         }
 
         draw = true;
@@ -241,7 +225,6 @@ fn main_loop<B: tui::backend::Backend>(
             Downloaded(PathBuf),
             Spin,
             Commit,
-            Blink,
         }
 
         #[derive(Debug)]
@@ -252,7 +235,6 @@ fn main_loop<B: tui::backend::Backend>(
             Downloaded(&'a PathBuf),
             Spin,
             Commit,
-            Blink,
         }
 
         impl<'a> From<&'a Message> for MessageDebug<'a> {
@@ -266,7 +248,6 @@ fn main_loop<B: tui::backend::Backend>(
                     Message::Downloaded(res) => MessageDebug::Downloaded(res),
                     Message::Spin => MessageDebug::Spin,
                     Message::Commit => MessageDebug::Commit,
-                    Message::Blink => MessageDebug::Blink,
                 }
             }
         }
@@ -284,7 +265,6 @@ fn main_loop<B: tui::backend::Backend>(
             futures::select! {
                 ev =  event_stream.next() => Message::Event(ev),
                 res =  &mut search_request => Message::SearchResponse(res),
-                _ = blink.next() => Message::Blink,
                 _ =  spin.next() => Message::Spin,
                 _ =  &mut throttle => Message::Commit,
                 preprint = &mut preprint_request => Message::PreprintResponse(preprint),
@@ -385,7 +365,7 @@ fn main_loop<B: tui::backend::Backend>(
                             .output
                             .as_ref()
                             .and_then(|res| res.as_ref().ok())
-                            .and_then(|entries| entries.get(state.focus as usize))
+                            .and_then(|table| table.entries.get(table.focus as usize))
                             .and_then(|entry| entry.eprint());
 
                         log::debug!("Preprint {:?}", preprint_id);
@@ -399,9 +379,9 @@ fn main_loop<B: tui::backend::Backend>(
             Message::SearchResponse(res) => {
                 log::debug!("search response {:?}", res);
 
-                state.focus = 0;
                 state.output = Some(
-                    res.map(|res| res.hits.hits.into_iter().map(|hit| hit.metadata).collect()),
+                    res.map(|res| res.hits.hits.into_iter().map(|hit| hit.metadata).collect())
+                        .map(|entries| TableState::new(entries)),
                 );
 
                 state.searching = false;
@@ -477,9 +457,6 @@ fn main_loop<B: tui::backend::Backend>(
                 // FIXME: handle
                 Command::new("xdg-open").arg(path).spawn();
             }
-            Message::Blink => {
-                state.blink = !state.blink;
-            }
         }
     }
 }
@@ -521,14 +498,96 @@ impl<F: FusedFuture> FusedFuture for InspectPoll<F> {
     }
 }
 
-struct UiState {
+struct TableState<T> {
+    entries: Vec<T>,
+    focus: u8,
     offset: u8,
+}
+
+impl<T> TableState<T> {
+    fn new(entries: Vec<T>) -> Self {
+        Self {
+            entries,
+            focus: 0,
+            offset: 0,
+        }
+    }
+    fn down(&mut self, step: u8) -> bool {
+        if self.entries.is_empty() {
+            return false;
+        }
+
+        let next_focus = (self.focus + step).min((self.entries.len() - 1) as u8);
+        self.change_focus(next_focus)
+    }
+
+    fn up(&mut self, step: u8) -> bool {
+        if self.entries.is_empty() {
+            return false;
+        }
+
+        let next_focus = self.focus.saturating_sub(step);
+        self.change_focus(next_focus)
+    }
+
+    /// (offset, marker)
+    fn draw(&mut self, size: usize) -> (usize, usize) {
+        let space = size as isize;
+        let mut offset = self.offset as isize;
+        let mut marker = self.focus as isize - offset;
+        let entries = self.entries.len() as isize;
+
+        log::trace!(
+            "space/entries = {}/{} marker = {} offset = {}",
+            space,
+            entries,
+            marker,
+            offset
+        );
+
+        if (marker + 1) > space {
+            offset += marker + 1 - space;
+            marker = space - 1;
+        } else if marker < 0 {
+            offset += marker;
+            marker = 0;
+        }
+
+        let showed = (entries - offset).min(space);
+
+        if showed < entries && showed < space {
+            let diff = space - showed;
+            let next_offset = (offset - diff).min(0);
+            marker += offset - next_offset;
+            offset = next_offset;
+        }
+
+        log::trace!(
+            "space/entries = {}/{} marker = {} offset = {}",
+            space,
+            entries,
+            marker,
+            offset
+        );
+
+        self.offset = offset as u8;
+
+        (offset as usize, marker as usize)
+    }
+
+    fn change_focus(&mut self, focus: u8) -> bool {
+        if focus == self.focus {
+            return false;
+        }
+
+        self.focus = focus;
+        true
+    }
 }
 
 fn ui<'t, 's, B: tui::backend::Backend>(
     terminal: &'t mut Terminal<B>,
-    state: &'s State,
-    ui_state: &'s mut UiState,
+    state: &'s mut State,
     spinner: &'s SpinnerState,
 ) -> Result<tui::terminal::CompletedFrame<'t>, io::Error> {
     terminal.draw(|f| {
@@ -554,13 +613,10 @@ fn ui<'t, 's, B: tui::backend::Backend>(
         text_chunk.x += 5;
         text_chunk.width -= 5;
         f.render_widget(
-            Block::default().title(if state.blink {
-                let mut input = state.input.clone();
-                input.push('█');
-                input
-            } else {
-                state.input.clone()
-            }),
+            Block::default().title(vec![
+                Span::raw(&state.input),
+                Span::styled("█", Style::default().add_modifier(Modifier::SLOW_BLINK)),
+            ]),
             text_chunk,
         );
 
@@ -573,10 +629,12 @@ fn ui<'t, 's, B: tui::backend::Backend>(
             .constraints([Constraint::Length(3), Constraint::Min(0)].as_ref())
             .split(results_chunk)[0];
 
-        let results = match &state.output {
+        let busy = state.busy();
+
+        let table = match &mut state.output {
             None => None,
             Some(Ok(res)) => {
-                if res.is_empty() {
+                if res.entries.is_empty() {
                     f.render_widget(
                         Block::default().title("No results".to_string()),
                         message_chunk,
@@ -592,39 +650,35 @@ fn ui<'t, 's, B: tui::backend::Backend>(
             }
         };
 
-        if let Some(results) = results {
-            let space = results_chunk.height as isize;
-            let mut offset = ui_state.offset as isize;
-            let mut focus_index = (state.focus as isize) - offset;
+        if let Some(table) = table {
+            let (offset, marker) = table.draw(results_chunk.height as usize);
 
-            if (focus_index + 1) > space {
-                offset += focus_index + 1 - space;
-                focus_index = space - 1;
-            } else if focus_index < 0 {
-                offset += focus_index;
-                focus_index = 0;
-            }
-
-            ui_state.offset = offset as u8;
-
-            let rows = results
+            let rows = table
+                .entries
                 .iter()
-                .skip(offset as usize)
-                .take(space as usize)
+                .skip(offset)
+                .take(results_chunk.height as usize)
                 .enumerate()
                 .map(|(i, metadata)| {
+                    let highlight = i == marker;
+                    let mark = !busy && highlight;
+
                     Row::new(vec![
                         format!(
                             "{} {}",
-                            if !state.busy() && i == focus_index as usize {
-                                ">"
-                            } else {
-                                " "
-                            },
+                            if mark { ">" } else { " " },
                             metadata.title().unwrap_or("(No title)")
                         ),
                         metadata.authors(),
                     ])
+                    .style(if highlight {
+                        Style::default()
+                            .bg(Color::LightBlue)
+                            .add_modifier(Modifier::BOLD)
+                            .fg(Color::Black)
+                    } else {
+                        Style::default()
+                    })
                 })
                 .collect::<Vec<_>>();
 
