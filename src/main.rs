@@ -142,6 +142,7 @@ fn main() -> anyhow::Result<()> {
 
 struct State {
     input: String,
+    cursor: usize,
     output: Option<surf::Result<TableState<Metadata>>>,
     searching: bool,
     fetching: bool,
@@ -150,6 +151,43 @@ struct State {
 impl State {
     fn busy(&self) -> bool {
         self.searching || self.fetching
+    }
+
+    fn append(&mut self, ch: char) {
+        if self.input.len() == self.cursor {
+            self.input.push(ch);
+        } else {
+            self.input.insert(self.cursor, ch);
+        }
+
+        self.cursor += 1;
+    }
+
+    fn delete(&mut self) -> bool {
+        if self.input.len() == self.cursor {
+            if self.input.pop().is_some() {
+                self.cursor -= 1;
+                true
+            } else {
+                false
+            }
+        } else if self.cursor > 0 {
+            self.input.remove(self.cursor - 1);
+            self.cursor -= 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn move_cursor(&mut self, step: i8) {
+        let cursor = if step < 0 {
+            self.cursor.saturating_sub(1)
+        } else {
+            (self.cursor + 1).min(self.input.len())
+        };
+
+        self.cursor = cursor;
     }
 
     fn down(&mut self, step: u8) -> bool {
@@ -190,6 +228,7 @@ fn main_loop<B: tui::backend::Backend>(
 
     let mut state = State {
         input: String::new(),
+        cursor: 0,
         output: None,
         searching: false,
         fetching: false,
@@ -309,7 +348,7 @@ fn main_loop<B: tui::backend::Backend>(
                         KeyCode::Esc => return Ok(()),
                         KeyCode::Char(ch) => {
                             if !state.fetching {
-                                state.input.push(ch);
+                                state.append(ch);
                                 Some(Action::Input)
                             } else {
                                 continue;
@@ -323,8 +362,11 @@ fn main_loop<B: tui::backend::Backend>(
                             }
                         }
                         KeyCode::Delete | KeyCode::Backspace => {
-                            state.input.pop();
-                            Some(Action::Input)
+                            if !state.fetching && state.delete() {
+                                Some(Action::Input)
+                            } else {
+                                continue;
+                            }
                         }
                         key @ (KeyCode::Down | KeyCode::PageDown) => {
                             let step = if key == KeyCode::Down { 1 } else { 10 };
@@ -342,6 +384,11 @@ fn main_loop<B: tui::backend::Backend>(
                             } else {
                                 continue;
                             }
+                        }
+                        key @ (KeyCode::Left | KeyCode::Right) => {
+                            let step = if key == KeyCode::Left { -1 } else { 1 };
+                            state.move_cursor(step);
+                            None
                         }
                         _ => continue,
                     },
@@ -592,7 +639,10 @@ fn ui<'t, 's, B: tui::backend::Backend>(
 ) -> Result<tui::terminal::CompletedFrame<'t>, io::Error> {
     terminal.draw(|f| {
         let size = f.size();
-        let block = Block::default().borders(Borders::ALL).title("πνέω");
+        let block = Block::default().borders(Borders::ALL).title(Span::styled(
+            "πνέω",
+            Style::default().add_modifier(Modifier::BOLD),
+        ));
         f.render_widget(block, size);
 
         let input_block = Block::default().borders(Borders::ALL);
@@ -613,12 +663,10 @@ fn ui<'t, 's, B: tui::backend::Backend>(
         text_chunk.x += 5;
         text_chunk.width -= 5;
         f.render_widget(
-            Block::default().title(vec![
-                Span::raw(&state.input),
-                Span::styled("█", Style::default().add_modifier(Modifier::SLOW_BLINK)),
-            ]),
+            Block::default().title(vec![Span::raw(&state.input)]),
             text_chunk,
         );
+        f.set_cursor(text_chunk.x + state.cursor as u16, text_chunk.y);
 
         text_chunk.x -= 3;
         text_chunk.width = 4;
