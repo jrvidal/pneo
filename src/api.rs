@@ -73,6 +73,7 @@ struct InspiresQuery {
     q: String,
     sort: &'static str,
     size: u32,
+    fields: &'static str,
 }
 
 #[derive(Serialize)]
@@ -89,6 +90,7 @@ pub async fn search_inspires(input: String) -> Result<InspiresSearchResult, surf
         q: input,
         sort: "mostrecent",
         size: 50,
+        fields: "titles,arxiv_eprints,authors",
     })?
     .await?;
 
