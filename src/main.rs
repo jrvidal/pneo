@@ -31,32 +31,39 @@ use crate::api::{ArxivSearchResult, InspiresSearchResult};
 mod api;
 
 fn main() -> anyhow::Result<()> {
-    let dir = {
-        let mut dir = dirs::config_dir().ok_or(io::Error::new(
-            io::ErrorKind::Other,
-            "unable to find config directory",
-        ))?;
-
+    let data_dir = {
+        let mut dir =
+            dirs::data_dir().ok_or(anyhow::anyhow!("unable to find suitable data directory"))?;
         dir.push("pneo");
-
         dir
     };
 
-    let cache = {
-        let mut cache = dir.clone();
-        cache.push("cache");
-        cache
+    let runtime_dir = {
+        let mut dir = dirs::runtime_dir()
+            .ok_or(anyhow::anyhow!("unable to find suitable runtime directory"))?;
+        dir.push("pneo");
+        dir
     };
 
-    std::fs::create_dir_all(&dir)
-        .context(format!("Unable to create config directory at {:?}", dir))?;
-    std::fs::create_dir_all(&cache)
-        .context(format!("Unable to create cache directory at {:?}", cache))?;
+    let preprint_dir = {
+        let mut dir = data_dir;
+        dir.push("preprints");
+        dir
+    };
+
+    std::fs::create_dir_all(&preprint_dir).context(format!(
+        "Unable to create data directory at {:?}",
+        preprint_dir
+    ))?;
+    std::fs::create_dir_all(&runtime_dir).context(format!(
+        "Unable to create runtime directory at {:?}",
+        runtime_dir
+    ))?;
 
     {
         let mut builder = env_logger::Builder::from_default_env();
         let logfile = {
-            let mut logfile = dir.clone();
+            let mut logfile = runtime_dir;
             logfile.push("pneo.log");
             logfile
         };
@@ -95,7 +102,7 @@ fn main() -> anyhow::Result<()> {
     let assert = AssertUnwindSafe(&mut terminal);
     let result = std::panic::catch_unwind(|| {
         let mut assert = assert;
-        main_loop(&mut assert.0, cache)
+        main_loop(&mut assert.0, preprint_dir)
     });
 
     fn stop_terminal(mut terminal: Terminal<CrosstermBackend<impl Write>>) -> io::Result<()> {
@@ -421,7 +428,7 @@ fn main_loop<B: tui::backend::Backend>(
                         // FIXME: handle
                         .ok_or(anyhow::anyhow!("unexpected arxiv id {:?}", url))?
                         .1;
-                    path.push(path_id);
+                    path.push(format!("{}.pdf", path_id));
                     path
                 };
 
