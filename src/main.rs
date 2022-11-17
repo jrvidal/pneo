@@ -2,7 +2,7 @@ use anyhow::Context;
 use api::Metadata;
 
 use crossterm::{
-    event::{DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode},
+    event::{DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, MouseEventKind},
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use futures::{
@@ -137,11 +137,46 @@ struct State {
     searching: bool,
     fetching: bool,
     focus: u8,
+    blink: bool,
 }
 
 impl State {
     fn busy(&self) -> bool {
         self.searching || self.fetching
+    }
+
+    fn down(&mut self, step: u8) -> bool {
+        if self.busy() {
+            return false;
+        }
+
+        let Some(Ok(entries)) = &self.output else {
+            return false;
+        };
+
+        if !entries.is_empty() {
+            self.focus = (self.focus + step).min((entries.len() - 1) as u8);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn up(&mut self, step: u8) -> bool {
+        if self.busy() {
+            return false;
+        }
+
+        let Some(Ok(entries)) = &self.output else {
+            return false;
+        };
+
+        if !entries.is_empty() {
+            self.focus = self.focus.saturating_sub(step);
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -162,6 +197,7 @@ fn main_loop<B: tui::backend::Backend>(
         searching: false,
         fetching: false,
         focus: 0,
+        blink: false,
     };
 
     let mut ui_state = UiState { offset: 0 };
@@ -175,10 +211,13 @@ fn main_loop<B: tui::backend::Backend>(
     let download_request = Fuse::terminated();
     let mut event_stream = EventStream::new().fuse();
     let throttle = Fuse::terminated();
+    let blink = ticks(600).fuse();
     futures::pin_mut!(search_request);
     futures::pin_mut!(preprint_request);
     futures::pin_mut!(download_request);
     futures::pin_mut!(throttle);
+    futures::pin_mut!(blink);
+
     loop {
         spinner_state.spin(state.busy());
         if draw {
@@ -195,6 +234,7 @@ fn main_loop<B: tui::backend::Backend>(
             Downloaded(PathBuf),
             Spin,
             Commit,
+            Blink,
         }
 
         #[derive(Debug)]
@@ -205,6 +245,7 @@ fn main_loop<B: tui::backend::Backend>(
             Downloaded(&'a PathBuf),
             Spin,
             Commit,
+            Blink,
         }
 
         impl<'a> From<&'a Message> for MessageDebug<'a> {
@@ -218,6 +259,7 @@ fn main_loop<B: tui::backend::Backend>(
                     Message::Downloaded(res) => MessageDebug::Downloaded(res),
                     Message::Spin => MessageDebug::Spin,
                     Message::Commit => MessageDebug::Commit,
+                    Message::Blink => MessageDebug::Blink,
                 }
             }
         }
@@ -235,6 +277,7 @@ fn main_loop<B: tui::backend::Backend>(
             futures::select! {
                 ev =  event_stream.next() => Message::Event(ev),
                 res =  &mut search_request => Message::SearchResponse(res),
+                _ = blink.next() => Message::Blink,
                 _ =  spin.next() => Message::Spin,
                 _ =  &mut throttle => Message::Commit,
                 preprint = &mut preprint_request => Message::PreprintResponse(preprint),
@@ -258,6 +301,23 @@ fn main_loop<B: tui::backend::Backend>(
                         draw = true;
                         continue;
                     }
+                    Event::Mouse(mouse) => match mouse.kind {
+                        MouseEventKind::ScrollDown => {
+                            if state.down(1) {
+                                None
+                            } else {
+                                continue;
+                            }
+                        }
+                        MouseEventKind::ScrollUp => {
+                            if state.up(1) {
+                                None
+                            } else {
+                                continue;
+                            }
+                        }
+                        _ => continue,
+                    },
                     Event::Key(key) => match key.code {
                         KeyCode::Esc => return Ok(()),
                         KeyCode::Char(ch) => {
@@ -280,29 +340,21 @@ fn main_loop<B: tui::backend::Backend>(
                             Some(Action::Input)
                         }
                         key @ (KeyCode::Down | KeyCode::PageDown) => {
-                            if state.busy() {
+                            let step = if key == KeyCode::Down { 1 } else { 10 };
+
+                            if state.down(step) {
+                                None
+                            } else {
                                 continue;
                             }
-
-                            if let Some(Ok(entries)) = &state.output {
-                                if !entries.is_empty() {
-                                    let step = if key == KeyCode::Down { 1 } else { 10 };
-                                    state.focus =
-                                        (state.focus + step).min((entries.len() - 1) as u8);
-                                }
-                            }
-                            None
                         }
                         key @ (KeyCode::Up | KeyCode::PageUp) => {
-                            if state.busy() {
+                            let step = if key == KeyCode::Up { 1 } else { 10 };
+                            if state.up(step) {
+                                None
+                            } else {
                                 continue;
                             }
-
-                            if let Some(Ok(_)) = &state.output {
-                                let step = if key == KeyCode::Up { 1 } else { 10 };
-                                state.focus = state.focus.saturating_sub(step);
-                            }
-                            None
                         }
                         _ => continue,
                     },
@@ -418,6 +470,9 @@ fn main_loop<B: tui::backend::Backend>(
                 // FIXME: handle
                 Command::new("xdg-open").arg(path).spawn();
             }
+            Message::Blink => {
+                state.blink = !state.blink;
+            }
         }
     }
 }
@@ -491,9 +546,17 @@ fn ui<'t, 's, B: tui::backend::Backend>(
         text_chunk.height -= 1;
         text_chunk.x += 5;
         text_chunk.width -= 5;
-        f.render_widget(Block::default().title(state.input.clone()), text_chunk);
+        f.render_widget(
+            Block::default().title(if state.blink {
+                let mut input = state.input.clone();
+                input.push('█');
+                input
+            } else {
+                state.input.clone()
+            }),
+            text_chunk,
+        );
 
-        // let icon = ["|", "/", "-", "\\"][(state.spinner % 4) as usize];
         text_chunk.x -= 3;
         text_chunk.width = 4;
         f.render_widget(Block::default().title(spinner.icon()), text_chunk);
