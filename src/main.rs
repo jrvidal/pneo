@@ -1,14 +1,12 @@
-use anyhow::Context;
-use api::Metadata;
-
+use anyhow::{Context, Result};
 use crossterm::{
     event::{DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, MouseEventKind},
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use futures::{
-    future::{Fuse, FusedFuture, OptionFuture},
+    future::{Fuse, FusedFuture},
     stream::{self, FusedStream},
-    Future, FutureExt, StreamExt,
+    Future, FutureExt, StreamExt, TryFutureExt,
 };
 use std::{
     io::{self, Write},
@@ -28,7 +26,7 @@ use tui::{
     Terminal,
 };
 
-use crate::api::{ArxivSearchResult, InspiresSearchResult};
+use crate::api::{ArxivSearchResult, InspiresSearchResult, Metadata};
 
 mod api;
 
@@ -260,10 +258,10 @@ fn main_loop<B: tui::backend::Backend>(
         draw = true;
 
         enum Message {
-            Event(Option<Result<Event, io::Error>>),
+            Event(Option<io::Result<Event>>),
             SearchResponse(surf::Result<InspiresSearchResult>),
             PreprintResponse(surf::Result<ArxivSearchResult>),
-            Downloaded(PathBuf),
+            Downloaded(Result<PathBuf>),
             Spin,
             Commit,
         }
@@ -273,7 +271,7 @@ fn main_loop<B: tui::backend::Backend>(
             Event(Option<&'a Event>),
             SearchResponse(&'a surf::Result<InspiresSearchResult>),
             PreprintResponse(&'a surf::Result<ArxivSearchResult>),
-            Downloaded(&'a PathBuf),
+            Downloaded(&'a Result<PathBuf>),
             Spin,
             Commit,
         }
@@ -467,40 +465,50 @@ fn main_loop<B: tui::backend::Backend>(
                 let url = link.href;
                 let path = {
                     let mut path = cache.clone();
-                    let path_id = url
+                    let path_id = match url
                         .rsplit_once("/")
-                        // FIXME: handle
-                        .ok_or(anyhow::anyhow!("unexpected arxiv id {:?}", url))?
-                        .1;
+                        .ok_or(anyhow::anyhow!("unexpected arxiv id {:?}", url))
+                    {
+                        Ok(path_id) => path_id.1,
+                        Err(err) => {
+                            state.fetching = false;
+                            log::error!("{:?}", err);
+                            state.warning = Some(format!("{}", err));
+                            continue;
+                        }
+                    };
                     path.push(format!("{}.pdf", path_id));
                     path
                 };
 
                 if std::path::Path::new(&path).exists() {
                     state.fetching = false;
-                    // FIXME: handle
                     Command::new("xdg-open").arg(path).spawn();
                     continue;
                 }
 
+                let request = surf::Client::new()
+                    .with(surf::middleware::Redirect::default())
+                    .get(url.clone())
+                    .map_err(surf::Error::into_inner);
+
                 download_request.set(
-                    surf::Client::new()
-                        .with(surf::middleware::Redirect::default())
-                        .get(url.clone())
-                        .then(|res| {
-                            OptionFuture::from(res.ok().map(|mut res| res.take_body().into_bytes()))
+                    request
+                        .and_then(|mut res| {
+                            res.take_body()
+                                .into_bytes()
+                                .map_err(surf::Error::into_inner)
                         })
-                        .map(|result| result.map(|res| res.ok()).flatten())
-                        .map({
+                        .map(|res| res.context("error downloading preprint"))
+                        .map_ok({
                             let path = path.clone();
                             move |bytes| {
-                                bytes.into_iter().for_each(|content| {
-                                    // FIXME: handle
-                                    std::fs::write(&path, content);
-                                })
+                                std::fs::write(&path, bytes)
+                                    .map_err(anyhow::Error::new)
+                                    .context("error saving preprint")
                             }
                         })
-                        .map(|_| path)
+                        .map_ok(|_| path)
                         .fuse(),
                 )
             }
@@ -516,8 +524,17 @@ fn main_loop<B: tui::backend::Backend>(
                 log::info!("requesting with {:?}", &state.input);
                 search_request.set(api::search_inspires(state.input.clone()).fuse());
             }
-            Message::Downloaded(path) => {
+            Message::Downloaded(result) => {
                 state.fetching = false;
+
+                let path = match result {
+                    Ok(path) => path,
+                    Err(err) => {
+                        log::error!("{:?}", err);
+                        state.warning = Some(format!("{}", err));
+                        continue;
+                    }
+                };
                 // FIXME: handle
                 Command::new("xdg-open").arg(path).spawn();
             }
