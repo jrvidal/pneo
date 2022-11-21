@@ -26,7 +26,7 @@ use tui::{
     Terminal,
 };
 
-use crate::api::{ArxivSearchResult, InspiresSearchResult, Metadata};
+use crate::api::{InspiresSearchResult, Metadata};
 
 mod api;
 
@@ -240,12 +240,10 @@ fn main_loop<B: tui::backend::Backend>(
 
     let search_request = Fuse::terminated();
     let preprint_request = Fuse::terminated();
-    let download_request = Fuse::terminated();
     let mut event_stream = EventStream::new().fuse();
     let throttle = Fuse::terminated();
     futures::pin_mut!(search_request);
     futures::pin_mut!(preprint_request);
-    futures::pin_mut!(download_request);
     futures::pin_mut!(throttle);
 
     loop {
@@ -260,8 +258,7 @@ fn main_loop<B: tui::backend::Backend>(
         enum Message {
             Event(Option<io::Result<Event>>),
             SearchResponse(surf::Result<InspiresSearchResult>),
-            PreprintResponse(surf::Result<ArxivSearchResult>),
-            Downloaded(Result<PathBuf>),
+            Preprint(Result<()>),
             Spin,
             Commit,
         }
@@ -270,8 +267,7 @@ fn main_loop<B: tui::backend::Backend>(
         enum MessageDebug<'a> {
             Event(Option<&'a Event>),
             SearchResponse(&'a surf::Result<InspiresSearchResult>),
-            PreprintResponse(&'a surf::Result<ArxivSearchResult>),
-            Downloaded(&'a Result<PathBuf>),
+            Preprint(&'a Result<()>),
             Spin,
             Commit,
         }
@@ -283,8 +279,7 @@ fn main_loop<B: tui::backend::Backend>(
                         MessageDebug::Event(event.as_ref().and_then(|ev| ev.as_ref().ok()))
                     }
                     Message::SearchResponse(res) => MessageDebug::SearchResponse(res),
-                    Message::PreprintResponse(res) => MessageDebug::PreprintResponse(res),
-                    Message::Downloaded(res) => MessageDebug::Downloaded(res),
+                    Message::Preprint(res) => MessageDebug::Preprint(res),
                     Message::Spin => MessageDebug::Spin,
                     Message::Commit => MessageDebug::Commit,
                 }
@@ -306,8 +301,7 @@ fn main_loop<B: tui::backend::Backend>(
                 res =  &mut search_request => Message::SearchResponse(res),
                 _ =  spin.next() => Message::Spin,
                 _ =  &mut throttle => Message::Commit,
-                preprint = &mut preprint_request => Message::PreprintResponse(preprint),
-                download = &mut download_request => Message::Downloaded(download),
+                preprint = &mut preprint_request => Message::Preprint(preprint),
             }
         });
 
@@ -430,7 +424,8 @@ fn main_loop<B: tui::backend::Backend>(
 
                         if let Some(preprint_id) = preprint_id {
                             state.fetching = true;
-                            preprint_request.set(api::get_preprint(preprint_id.to_string()).fuse());
+                            preprint_request
+                                .set(download(preprint_id.to_owned(), cache.clone()).fuse());
                         } else {
                             log::warn!("unable to find preprint link for {:?}", entry);
                             state.warning = Some(format!("Unable to find preprint link"));
@@ -448,70 +443,6 @@ fn main_loop<B: tui::backend::Backend>(
 
                 state.searching = false;
             }
-            Message::PreprintResponse(res) => {
-                let link = res
-                    .ok()
-                    .into_iter()
-                    .flat_map(|result| result.entry.into_iter())
-                    .flat_map(|entry| entry.link.into_iter())
-                    .filter(|link| link.title.as_deref() == Some("pdf"))
-                    .next();
-
-                let Some(link) = link else {
-                    state.fetching = false;
-                    continue;
-                };
-
-                let url = link.href;
-                let path = {
-                    let mut path = cache.clone();
-                    let path_id = match url
-                        .rsplit_once("/")
-                        .ok_or(anyhow::anyhow!("unexpected arxiv id {:?}", url))
-                    {
-                        Ok(path_id) => path_id.1,
-                        Err(err) => {
-                            state.fetching = false;
-                            log::error!("{:?}", err);
-                            state.warning = Some(format!("{}", err));
-                            continue;
-                        }
-                    };
-                    path.push(format!("{}.pdf", path_id));
-                    path
-                };
-
-                if std::path::Path::new(&path).exists() {
-                    state.fetching = false;
-                    Command::new("xdg-open").arg(path).spawn();
-                    continue;
-                }
-
-                let request = surf::Client::new()
-                    .with(surf::middleware::Redirect::default())
-                    .get(url.clone())
-                    .map_err(surf::Error::into_inner);
-
-                download_request.set(
-                    request
-                        .and_then(|mut res| {
-                            res.take_body()
-                                .into_bytes()
-                                .map_err(surf::Error::into_inner)
-                        })
-                        .map(|res| res.context("error downloading preprint"))
-                        .map_ok({
-                            let path = path.clone();
-                            move |bytes| {
-                                std::fs::write(&path, bytes)
-                                    .map_err(anyhow::Error::new)
-                                    .context("error saving preprint")
-                            }
-                        })
-                        .map_ok(|_| path)
-                        .fuse(),
-                )
-            }
             Message::Spin => {
                 spinner_state.tick();
             }
@@ -524,19 +455,13 @@ fn main_loop<B: tui::backend::Backend>(
                 log::info!("requesting with {:?}", &state.input);
                 search_request.set(api::search_inspires(state.input.clone()).fuse());
             }
-            Message::Downloaded(result) => {
+            Message::Preprint(res) => {
                 state.fetching = false;
 
-                let path = match result {
-                    Ok(path) => path,
-                    Err(err) => {
-                        log::error!("{:?}", err);
-                        state.warning = Some(format!("{}", err));
-                        continue;
-                    }
-                };
-                // FIXME: handle
-                Command::new("xdg-open").arg(path).spawn();
+                if let Err(err) = res {
+                    log::error!("{:?}", err);
+                    state.warning = Some(format!("{}", err));
+                }
             }
         }
     }
@@ -803,7 +728,6 @@ fn ui<'t, 's, B: tui::backend::Backend>(
                 f.render_widget(warning_block, chunks[1]);
 
                 let message_chunk = chunks[1].inner(&Margin {
-                    // log::warn!("unable to find preprint link for {:?}", )
                     vertical: 3,
                     horizontal: 3,
                 });
@@ -860,4 +784,61 @@ impl SpinnerState {
             ["|", "/", "-", "\\"][(self.frame % 4) as usize]
         }
     }
+}
+
+async fn download(preprint_id: String, path: PathBuf) -> Result<()> {
+    let preprint = api::get_preprint(preprint_id.to_string())
+        .await
+        .map_err(surf::Error::into_inner)
+        .context("error downloading preprint info")?;
+
+    let link = preprint
+        .entry
+        .into_iter()
+        .flat_map(|entry| entry.link.into_iter())
+        .filter(|link| link.title.as_deref() == Some("pdf"))
+        .next();
+
+    let Some(link) = link else {
+        anyhow::bail!("unable to find pdf link");
+    };
+
+    let url = link.href;
+    let path = {
+        let mut path = path;
+        let path_id = url
+            .rsplit_once("/")
+            .ok_or(anyhow::anyhow!("unexpected arxiv id {:?}", url))?
+            .1;
+        path.push(format!("{}.pdf", path_id));
+        path
+    };
+
+    if std::path::Path::new(&path).exists() {
+        return open_preprint(path);
+    }
+
+    let mut response = surf::Client::new()
+        .with(surf::middleware::Redirect::default())
+        .get(url.clone())
+        .map_err(surf::Error::into_inner)
+        .await
+        .context("error downloading pdf")?;
+
+    let bytes = response
+        .body_bytes()
+        .await
+        .map_err(surf::Error::into_inner)?;
+
+    std::fs::write(&path, bytes).context("error saving preprint")?;
+
+    open_preprint(path)
+}
+
+fn open_preprint(path: PathBuf) -> Result<()> {
+    Command::new("xdg-open")
+        .arg(path)
+        .spawn()
+        .context("unable to open preprint")?;
+    Ok(())
 }
