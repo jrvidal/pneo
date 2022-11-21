@@ -1,6 +1,9 @@
 use anyhow::{Context, Result};
 use crossterm::{
-    event::{DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, MouseEventKind},
+    event::{
+        DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, MouseButton,
+        MouseEvent, MouseEventKind,
+    },
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use futures::{
@@ -15,11 +18,11 @@ use std::{
     pin::Pin,
     process::Command,
     task::Poll,
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 use tui::{
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout, Margin},
+    layout::{Constraint, Direction, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
     text::Span,
     widgets::{Block, Borders, Row, Table},
@@ -69,7 +72,7 @@ fn main() -> anyhow::Result<()> {
         };
 
         builder
-            .filter_level(log::LevelFilter::Warn)
+            .filter_module("pneo", log::LevelFilter::Info)
             .target(env_logger::Target::Pipe(Box::new(
                 std::fs::File::create(logfile).context("Unable to create logfile")?,
             )));
@@ -147,6 +150,12 @@ struct State {
     warning: Option<String>,
 }
 
+struct Hitbox {
+    table_size: Rect,
+    /// (offset, height)
+    table: (usize, usize),
+}
+
 impl State {
     fn busy(&self) -> bool {
         self.searching || self.fetching
@@ -189,7 +198,7 @@ impl State {
         self.cursor = cursor;
     }
 
-    fn down(&mut self, step: u8) -> bool {
+    fn down(&mut self, step: u16) -> bool {
         if self.busy() {
             return false;
         }
@@ -201,7 +210,7 @@ impl State {
         table.down(step)
     }
 
-    fn up(&mut self, step: u8) -> bool {
+    fn up(&mut self, step: u16) -> bool {
         if self.busy() {
             return false;
         }
@@ -211,6 +220,18 @@ impl State {
         };
 
         table.up(step)
+    }
+
+    fn click_entry(&mut self, row: u16) -> bool {
+        if self.busy() {
+            return false;
+        }
+
+        let Some(Ok(table)) = &mut self.output else {
+            return false;
+        };
+
+        table.set(row)
     }
 }
 
@@ -234,9 +255,15 @@ fn main_loop<B: tui::backend::Backend>(
         warning: None,
     };
 
+    let mut hitbox = Hitbox {
+        table_size: Default::default(),
+        table: (0, 0),
+    };
+
     let mut spinner_state = SpinnerState::new();
 
     let mut draw = true;
+    let mut last_click = (std::time::UNIX_EPOCH, u16::MAX);
 
     let search_request = Fuse::terminated();
     let preprint_request = Fuse::terminated();
@@ -250,7 +277,7 @@ fn main_loop<B: tui::backend::Backend>(
         spinner_state.spin(state.busy());
         if draw {
             log::debug!("drawing!");
-            ui(terminal, &mut state, &spinner_state)?;
+            ui(terminal, &mut state, &spinner_state, &mut hitbox)?;
         }
 
         draw = true;
@@ -331,6 +358,53 @@ fn main_loop<B: tui::backend::Backend>(
                         }
                         MouseEventKind::ScrollUp => {
                             if state.up(1) {
+                                None
+                            } else {
+                                continue;
+                            }
+                        }
+                        MouseEventKind::Up(MouseButton::Left) => {
+                            let MouseEvent { column, row, .. } = mouse;
+
+                            let click = Rect {
+                                x: column,
+                                y: row,
+                                width: 1,
+                                height: 1,
+                            };
+
+                            if !hitbox.table_size.intersects(click) {
+                                continue;
+                            }
+
+                            let index = click.y - hitbox.table_size.y + (hitbox.table.0 as u16);
+
+                            let changed = state.click_entry(index);
+
+                            let clicked = state
+                                .output
+                                .as_ref()
+                                .map(|res| res.as_ref().ok())
+                                .flatten()
+                                .map(|table| table.focus == index)
+                                .unwrap_or(false);
+
+                            let in_window = last_click
+                                .0
+                                .elapsed()
+                                .ok()
+                                .map(|dur| dur < Duration::from_millis(500))
+                                .unwrap_or(true);
+
+                            let same_row = last_click.1 == index;
+
+                            if clicked {
+                                last_click = (SystemTime::now(), index);
+                            }
+
+                            if in_window && same_row {
+                                Some(Action::Select)
+                            } else if changed {
                                 None
                             } else {
                                 continue;
@@ -506,8 +580,8 @@ impl<F: FusedFuture> FusedFuture for InspectPoll<F> {
 
 struct TableState<T> {
     entries: Vec<T>,
-    focus: u8,
-    offset: u8,
+    focus: u16,
+    offset: u16,
 }
 
 impl<T> TableState<T> {
@@ -518,16 +592,16 @@ impl<T> TableState<T> {
             offset: 0,
         }
     }
-    fn down(&mut self, step: u8) -> bool {
+    fn down(&mut self, step: u16) -> bool {
         if self.entries.is_empty() {
             return false;
         }
 
-        let next_focus = (self.focus + step).min((self.entries.len() - 1) as u8);
+        let next_focus = (self.focus + step).min((self.entries.len() - 1) as u16);
         self.change_focus(next_focus)
     }
 
-    fn up(&mut self, step: u8) -> bool {
+    fn up(&mut self, step: u16) -> bool {
         if self.entries.is_empty() {
             return false;
         }
@@ -576,12 +650,12 @@ impl<T> TableState<T> {
             offset
         );
 
-        self.offset = offset as u8;
+        self.offset = offset as u16;
 
         (offset as usize, marker as usize)
     }
 
-    fn change_focus(&mut self, focus: u8) -> bool {
+    fn change_focus(&mut self, focus: u16) -> bool {
         if focus == self.focus {
             return false;
         }
@@ -589,12 +663,21 @@ impl<T> TableState<T> {
         self.focus = focus;
         true
     }
+
+    fn set(&mut self, row: u16) -> bool {
+        if self.entries.is_empty() {
+            return false;
+        }
+
+        self.change_focus(row)
+    }
 }
 
 fn ui<'t, 's, B: tui::backend::Backend>(
     terminal: &'t mut Terminal<B>,
     state: &'s mut State,
     spinner: &'s SpinnerState,
+    hitbox: &'s mut Hitbox,
 ) -> Result<tui::terminal::CompletedFrame<'t>, io::Error> {
     terminal.draw(|f| {
         let size = f.size();
@@ -688,6 +771,13 @@ fn ui<'t, 's, B: tui::backend::Backend>(
                     })
                 })
                 .collect::<Vec<_>>();
+
+            hitbox.table = (
+                offset,
+                (results_chunk.height as usize).min(table.entries.len() - offset),
+            );
+
+            hitbox.table_size = results_chunk;
 
             f.render_widget(
                 Table::new(rows).widths(&[Constraint::Percentage(70), Constraint::Percentage(30)]),
@@ -787,6 +877,8 @@ impl SpinnerState {
 }
 
 async fn download(preprint_id: String, path: PathBuf) -> Result<()> {
+    log::info!("requesting preprint {}", &preprint_id);
+
     let preprint = api::get_preprint(preprint_id.to_string())
         .await
         .map_err(surf::Error::into_inner)
@@ -815,12 +907,15 @@ async fn download(preprint_id: String, path: PathBuf) -> Result<()> {
     };
 
     if std::path::Path::new(&path).exists() {
+        log::info!("no need to download {:?}", path);
         return open_preprint(path);
     }
 
+    log::info!("downloading {}", url);
+
     let mut response = surf::Client::new()
         .with(surf::middleware::Redirect::default())
-        .get(url.clone())
+        .get(url)
         .map_err(surf::Error::into_inner)
         .await
         .context("error downloading pdf")?;
