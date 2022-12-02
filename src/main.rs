@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use crossterm::{
     event::{
-        DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, MouseButton,
-        MouseEvent, MouseEventKind,
+        DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyModifiers,
+        MouseButton, MouseEvent, MouseEventKind,
     },
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -11,12 +11,15 @@ use futures::{
     stream::{self, FusedStream},
     Future, FutureExt, StreamExt, TryFutureExt,
 };
+use rusqlite::Connection;
 use std::{
+    collections::HashSet,
     io::{self, Write},
     panic::AssertUnwindSafe,
-    path::PathBuf,
+    path::Path,
     pin::Pin,
     process::Command,
+    sync::Arc,
     task::Poll,
     time::{Duration, SystemTime},
 };
@@ -29,9 +32,13 @@ use tui::{
     Terminal,
 };
 
-use crate::api::{InspiresSearchResult, Metadata};
+use crate::{
+    api::{InspiresSearchResult, Metadata},
+    cache::Cache,
+};
 
 mod api;
+mod cache;
 
 fn main() -> anyhow::Result<()> {
     let data_dir = {
@@ -49,7 +56,7 @@ fn main() -> anyhow::Result<()> {
     };
 
     let preprint_dir = {
-        let mut dir = data_dir;
+        let mut dir = data_dir.clone();
         dir.push("preprints");
         dir
     };
@@ -64,18 +71,18 @@ fn main() -> anyhow::Result<()> {
     ))?;
 
     {
-        let mut builder = env_logger::Builder::from_default_env();
+        let mut builder = env_logger::Builder::from_env(
+            env_logger::Env::default().filter_or("PNEO_LOG", "pneo=info"),
+        );
         let logfile = {
             let mut logfile = runtime_dir;
             logfile.push("pneo.log");
             logfile
         };
 
-        builder
-            .filter_module("pneo", log::LevelFilter::Info)
-            .target(env_logger::Target::Pipe(Box::new(
-                std::fs::File::create(logfile).context("Unable to create logfile")?,
-            )));
+        builder.target(env_logger::Target::Pipe(Box::new(
+            std::fs::File::create(logfile).context("Unable to create logfile")?,
+        )));
 
         builder.init();
     }
@@ -84,6 +91,17 @@ fn main() -> anyhow::Result<()> {
         println!("pneo {}", std::env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
+
+    let connection = Connection::open({
+        let mut db = data_dir;
+        db.push("pneo.db");
+        db
+    })
+    .context("unable to create database")?;
+
+    let mut cache = Cache::new(connection, preprint_dir);
+
+    cache.init().context("unable to initialize database")?;
 
     fn start_terminal() -> io::Result<Terminal<CrosstermBackend<impl Write>>> {
         enable_raw_mode()?;
@@ -102,10 +120,10 @@ fn main() -> anyhow::Result<()> {
         res => res,
     }?;
 
-    let assert = AssertUnwindSafe(&mut terminal);
+    let assert = AssertUnwindSafe((&mut terminal, cache));
     let result = std::panic::catch_unwind(|| {
-        let mut assert = assert;
-        main_loop(&mut assert.0, preprint_dir)
+        let assert = assert;
+        main_loop(assert.0 .0, assert.0 .1)
     });
 
     fn stop_terminal(mut terminal: Terminal<CrosstermBackend<impl Write>>) -> io::Result<()> {
@@ -148,6 +166,7 @@ struct State {
     searching: bool,
     fetching: bool,
     warning: Option<String>,
+    downloaded: HashSet<String>,
 }
 
 struct Hitbox {
@@ -237,7 +256,7 @@ impl State {
 
 fn main_loop<B: tui::backend::Backend>(
     terminal: &mut Terminal<B>,
-    cache: PathBuf,
+    cache: Cache,
 ) -> anyhow::Result<()> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_time()
@@ -246,6 +265,8 @@ fn main_loop<B: tui::backend::Backend>(
 
     let _guard = runtime.enter();
 
+    let cache = Arc::new(cache);
+
     let mut state = State {
         input: String::new(),
         cursor: 0,
@@ -253,6 +274,7 @@ fn main_loop<B: tui::backend::Backend>(
         searching: false,
         fetching: false,
         warning: None,
+        downloaded: cache.get_downloaded()?,
     };
 
     let mut hitbox = Hitbox {
@@ -263,6 +285,7 @@ fn main_loop<B: tui::backend::Backend>(
     let mut spinner_state = SpinnerState::new();
 
     let mut draw = true;
+    let mut redraw = false;
     let mut last_click = (std::time::UNIX_EPOCH, u16::MAX);
 
     let search_request = Fuse::terminated();
@@ -275,12 +298,14 @@ fn main_loop<B: tui::backend::Backend>(
 
     loop {
         spinner_state.spin(state.busy());
+
         if draw {
             log::debug!("drawing!");
-            ui(terminal, &mut state, &spinner_state, &mut hitbox)?;
+            ui(terminal, &mut state, &spinner_state, &mut hitbox, redraw)?;
         }
 
         draw = true;
+        redraw = false;
 
         enum Message {
             Event(Option<io::Result<Event>>),
@@ -338,6 +363,7 @@ fn main_loop<B: tui::backend::Backend>(
             Message::Event(None) => return Ok(()),
             Message::Event(Some(ev)) => {
                 draw = false;
+
                 enum Action {
                     Input,
                     Select,
@@ -421,6 +447,11 @@ fn main_loop<B: tui::backend::Backend>(
                             }
                         }
                         KeyCode::Char(ch) => {
+                            if key.modifiers == KeyModifiers::CONTROL && ch == 'r' {
+                                draw = true;
+                                redraw = true;
+                                continue;
+                            }
                             if !state.fetching {
                                 state.append(ch);
                                 Some(Action::Input)
@@ -492,17 +523,44 @@ fn main_loop<B: tui::backend::Backend>(
 
                         let entry = table.entries.get(table.focus as usize);
 
-                        let preprint_id = entry.and_then(|entry| entry.eprint());
-
-                        log::debug!("Preprint {:?}", preprint_id);
-
-                        if let Some(preprint_id) = preprint_id {
-                            state.fetching = true;
-                            preprint_request
-                                .set(download(preprint_id.to_owned(), cache.clone()).fuse());
-                        } else {
+                        let Some(entry) = entry else {
                             log::warn!("unable to find preprint link for {:?}", entry);
                             state.warning = Some(format!("Unable to find preprint link"));
+                            continue;
+                        };
+
+                        let preprint_id = {
+                            let mut eprints = entry.eprints();
+                            if eprints.len() > 1 {
+                                log::warn!("multiple eprints for {:?}", entry);
+                            }
+                            eprints.next()
+                        };
+
+                        log::debug!("preprint {:?}", preprint_id);
+
+                        match preprint_id
+                            .as_ref()
+                            .map(|id| cache.preprint_file_from_id(id))
+                        {
+                            None => {
+                                log::warn!("unable to find preprint link for {:?}", entry);
+                                state.warning = Some(format!("Unable to find preprint link"));
+                            }
+                            Some(Err(err)) => {
+                                state.warning = Some(format!("{}", err));
+                            }
+                            Some(Ok(None)) => {
+                                state.fetching = true;
+                                preprint_request.set(
+                                    download(preprint_id.unwrap().to_owned(), cache.clone()).fuse(),
+                                );
+                            }
+                            Some(Ok(Some(filename))) => {
+                                state.warning = open_preprint(Path::new(&filename))
+                                    .err()
+                                    .map(|err| err.to_string());
+                            }
                         }
                     }
                 }
@@ -531,10 +589,19 @@ fn main_loop<B: tui::backend::Backend>(
             }
             Message::Preprint(res) => {
                 state.fetching = false;
+                let update = cache.get_downloaded().map_err(|e| e.to_string());
 
                 if let Err(err) = res {
                     log::error!("{:?}", err);
                     state.warning = Some(format!("{}", err));
+                    continue;
+                }
+
+                match update {
+                    Ok(downloaded) => state.downloaded = downloaded,
+                    Err(error) => {
+                        state.warning = Some(error);
+                    }
                 }
             }
         }
@@ -678,7 +745,11 @@ fn ui<'t, 's, B: tui::backend::Backend>(
     state: &'s mut State,
     spinner: &'s SpinnerState,
     hitbox: &'s mut Hitbox,
+    redraw: bool,
 ) -> Result<tui::terminal::CompletedFrame<'t>, io::Error> {
+    if redraw {
+        terminal.clear()?;
+    }
     terminal.draw(|f| {
         let size = f.size();
         let block = Block::default().borders(Borders::ALL).title(Span::styled(
@@ -752,13 +823,19 @@ fn ui<'t, 's, B: tui::backend::Backend>(
                 .map(|(i, metadata)| {
                     let highlight = i == marker;
                     let mark = !busy && highlight;
+                    let downloaded = metadata
+                        .eprint()
+                        .map(|id| state.downloaded.contains(id))
+                        .unwrap_or(false);
 
                     Row::new(vec![
                         format!(
-                            "{} {}",
+                            "{} {} {}",
                             if mark { ">" } else { " " },
+                            if downloaded { "✔" } else { " " },
                             metadata.title().unwrap_or("(No title)")
                         ),
+                        metadata.eprint().unwrap_or("").to_string(),
                         metadata.authors(),
                     ])
                     .style(if highlight {
@@ -780,7 +857,11 @@ fn ui<'t, 's, B: tui::backend::Backend>(
             hitbox.table_size = results_chunk;
 
             f.render_widget(
-                Table::new(rows).widths(&[Constraint::Percentage(70), Constraint::Percentage(30)]),
+                Table::new(rows).widths(&[
+                    Constraint::Percentage(65),
+                    Constraint::Percentage(10),
+                    Constraint::Percentage(25),
+                ]),
                 results_chunk,
             );
 
@@ -876,7 +957,7 @@ impl SpinnerState {
     }
 }
 
-async fn download(preprint_id: String, path: PathBuf) -> Result<()> {
+async fn download(preprint_id: String, cache: Arc<Cache>) -> Result<()> {
     log::info!("requesting preprint {}", &preprint_id);
 
     let preprint = api::get_preprint(preprint_id.to_string())
@@ -884,10 +965,15 @@ async fn download(preprint_id: String, path: PathBuf) -> Result<()> {
         .map_err(surf::Error::into_inner)
         .context("error downloading preprint info")?;
 
-    let link = preprint
-        .entry
-        .into_iter()
-        .flat_map(|entry| entry.link.into_iter())
+    let entry = if preprint.entry.len() == 1 {
+        &preprint.entry[0]
+    } else {
+        anyhow::bail!("invalid preprint response {:?}", preprint)
+    };
+
+    let link = entry
+        .link
+        .iter()
         .filter(|link| link.title.as_deref() == Some("pdf"))
         .next();
 
@@ -895,27 +981,13 @@ async fn download(preprint_id: String, path: PathBuf) -> Result<()> {
         anyhow::bail!("unable to find pdf link");
     };
 
-    let url = link.href;
-    let path = {
-        let mut path = path;
-        let path_id = url
-            .rsplit_once("/")
-            .ok_or(anyhow::anyhow!("unexpected arxiv id {:?}", url))?
-            .1;
-        path.push(format!("{}.pdf", path_id));
-        path
-    };
-
-    if std::path::Path::new(&path).exists() {
-        log::info!("no need to download {:?}", path);
-        return open_preprint(path);
-    }
+    let url = &link.href;
 
     log::info!("downloading {}", url);
 
     let mut response = surf::Client::new()
         .with(surf::middleware::Redirect::default())
-        .get(url)
+        .get(&url)
         .map_err(surf::Error::into_inner)
         .await
         .context("error downloading pdf")?;
@@ -925,15 +997,32 @@ async fn download(preprint_id: String, path: PathBuf) -> Result<()> {
         .await
         .map_err(surf::Error::into_inner)?;
 
-    std::fs::write(&path, bytes).context("error saving preprint")?;
+    let path = cache
+        .insert(&entry.id, &preprint_id, &url, bytes)
+        .context("error saving preprint")?;
 
-    open_preprint(path)
+    open_preprint(&path)
 }
 
-fn open_preprint(path: PathBuf) -> Result<()> {
-    Command::new("xdg-open")
+fn open_preprint(path: &Path) -> Result<()> {
+    log::info!("opening {:?}", path);
+
+    let output = Command::new("xdg-open")
         .arg(path)
-        .spawn()
+        .output()
         .context("unable to open preprint")?;
-    Ok(())
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    anyhow::bail!(
+        "unable to open preprint, command failed with {}\n{}\n{}",
+        output.status,
+        stdout,
+        stderr
+    )
 }

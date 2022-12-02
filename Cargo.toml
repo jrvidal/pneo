@@ -12,6 +12,7 @@ env_logger = "0.9.3"
 futures = "0.3.25"
 log = "0.4.17"
 quick-xml = { version = "0.26.0", features = ["serialize", "overlapped-lists"] }
+rusqlite = { version = "0.28.0", features = ["bundled"] }
 serde = { version = "1.0.147", features = ["derive"] }
 surf = "2.3.2"
 tokio = { version = "1.21.2", features = ["rt", "time"] }

@@ -61,6 +61,10 @@ impl Metadata {
     pub fn eprint(&self) -> Option<&str> {
         self.arxiv_eprints.get(0).map(|e| &e.value[..])
     }
+
+    pub fn eprints(&self) -> impl ExactSizeIterator<Item = &str> {
+        self.arxiv_eprints.iter().map(|entry| entry.value.as_ref())
+    }
 }
 
 #[derive(Deserialize, Debug)]
