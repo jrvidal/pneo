@@ -35,6 +35,7 @@ impl Cache {
         Ok(())
     }
 
+    #[deprecated]
     fn try_migrate_v1(&mut self) -> Result<()> {
         let entries: usize =
             self.connection

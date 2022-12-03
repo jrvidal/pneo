@@ -28,7 +28,7 @@ use tui::{
     layout::{Constraint, Direction, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
     text::Span,
-    widgets::{Block, Borders, Row, Table},
+    widgets::{Block, Borders, Paragraph, Row, Table},
     Terminal,
 };
 
@@ -870,39 +870,57 @@ fn ui<'t, 's, B: tui::backend::Backend>(
                     .direction(Direction::Horizontal)
                     .constraints(
                         [
-                            Constraint::Percentage(33),
-                            Constraint::Percentage(33),
+                            Constraint::Percentage(25),
+                            Constraint::Percentage(50),
                             Constraint::Min(0),
                         ]
                         .as_ref(),
                     )
                     .split(size);
 
-                let chunks = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints(
-                        [
-                            Constraint::Percentage(30),
-                            Constraint::Percentage(40),
-                            Constraint::Min(0),
-                        ]
-                        .as_ref(),
-                    )
-                    .split(chunks[1]);
+                let padding = 1;
 
-                let warning_block = Block::default()
+                let warning_rect = {
+                    let width = chunks[1].width;
+                    let margin = 1 + padding;
+                    let effective_width = width - 2 * margin;
+                    let effective_lines = warning.lines().fold(0, |acc, line| {
+                        acc + (line.len() as u16 / effective_width) + 1
+                    });
+
+                    let mut rect = chunks[1];
+                    let height = rect.height;
+
+                    let desired_height = effective_lines + 2 * margin;
+
+                    rect.height = desired_height.max(rect.height / 3);
+                    rect.y = (height - rect.height) / 2;
+                    rect
+                };
+
+                f.render_widget(tui::widgets::Clear, warning_rect);
+
+                let outer_block = Block::default()
                     .borders(Borders::ALL)
                     .border_type(tui::widgets::BorderType::Double)
                     .border_style(Style::default().bg(Color::LightRed));
 
-                f.render_widget(tui::widgets::Clear, chunks[1]);
-                f.render_widget(warning_block, chunks[1]);
+                let inner = {
+                    let mut inner = outer_block.inner(warning_rect);
 
-                let message_chunk = chunks[1].inner(&Margin {
-                    vertical: 3,
-                    horizontal: 3,
-                });
-                f.render_widget(Block::default().title(&warning[..]), message_chunk);
+                    inner.x += padding;
+                    inner.y += padding;
+                    inner.height -= padding;
+                    inner.width -= padding;
+                    inner
+                };
+
+                f.render_widget(outer_block, warning_rect);
+
+                f.render_widget(
+                    Paragraph::new(&warning[..]).wrap(tui::widgets::Wrap { trim: false }),
+                    inner,
+                );
             }
         }
     })
@@ -1007,22 +1025,33 @@ async fn download(preprint_id: String, cache: Arc<Cache>) -> Result<()> {
 fn open_preprint(path: &Path) -> Result<()> {
     log::info!("opening {:?}", path);
 
-    let output = Command::new("xdg-open")
+    let mut child = Command::new("xdg-open")
         .arg(path)
-        .output()
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .context("unable to open preprint")?;
 
-    if output.status.success() {
+    let status = child.wait()?;
+
+    if status.success() {
         return Ok(());
     }
+
+    let output = child.wait_with_output()?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
-    anyhow::bail!(
-        "unable to open preprint, command failed with {}\n{}\n{}",
-        output.status,
+    let error = anyhow::anyhow!(
+        "unable to open preprint, xdg-open failed with {}\n{}\n{}",
+        status,
         stdout,
         stderr
-    )
+    );
+
+    log::error!("{:?}", error);
+
+    Err(error)
 }
