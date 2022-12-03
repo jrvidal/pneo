@@ -6,8 +6,8 @@ Inspired by [spires.app](https://member.ipmu.jp/yuji.tachikawa/spires/).
 
 ## How it works
 
-* Write into the text input, arrow keys `🠈 `, `🠊` to move the cursor.
-* Arrow keys `🠉 `, `🠋` to select an entry, `Enter` to download/open it.
+* Write into the text input, arrow keys `🠈`, `🠊` to move the cursor.
+* Arrow keys `🠉`, `🠋` to select an entry, `Enter` to download/open it.
   * `PgDn`, `PgUp`, mouse scrolling also work for moving, double click works for downloads.
 * `Ctrl+R` refreshes the whole screen, in case something interferes with terminal output.
 * `Esc` to close dialogs and/or exit.
