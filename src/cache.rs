@@ -1,4 +1,4 @@
-use std::{collections::HashSet, path::PathBuf};
+use std::{collections::HashMap, path::PathBuf};
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension};
@@ -161,20 +161,16 @@ impl Cache {
         Ok(path)
     }
 
-    pub fn get_downloaded(&self) -> Result<HashSet<String>> {
-        self.do_get_downloaded()
-    }
-
-    fn do_get_downloaded(&self) -> Result<HashSet<String>> {
+    pub fn get_downloaded(&self) -> Result<HashMap<String, u8>> {
         let mut stmt = self
             .connection
-            .prepare_cached("SELECT DISTINCT id FROM eprints")?;
+            .prepare_cached("SELECT id, MAX(version) FROM eprints GROUP BY id")?;
 
-        let ids: HashSet<String> = stmt
-            .query_map((), |row| row.get(0))?
+        let eprints: HashMap<String, u8> = stmt
+            .query_map((), |row| Ok((row.get(0)?, row.get(1)?)))?
             .collect::<Result<_, _>>()?;
 
-        Ok(ids)
+        Ok(eprints)
     }
 }
 

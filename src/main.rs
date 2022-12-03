@@ -13,7 +13,7 @@ use futures::{
 };
 use rusqlite::Connection;
 use std::{
-    collections::HashSet,
+    collections::HashMap,
     io::{self, Write},
     panic::AssertUnwindSafe,
     path::Path,
@@ -25,7 +25,7 @@ use std::{
 };
 use tui::{
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout, Margin, Rect},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::Span,
     widgets::{Block, Borders, Paragraph, Row, Table},
@@ -166,7 +166,7 @@ struct State {
     searching: bool,
     fetching: bool,
     warning: Option<String>,
-    downloaded: HashSet<String>,
+    downloaded: HashMap<String, u8>,
 }
 
 struct Hitbox {
@@ -823,10 +823,10 @@ fn ui<'t, 's, B: tui::backend::Backend>(
                 .map(|(i, metadata)| {
                     let highlight = i == marker;
                     let mark = !busy && highlight;
-                    let downloaded = metadata
+                    let version = metadata
                         .eprint()
-                        .map(|id| state.downloaded.contains(id))
-                        .unwrap_or(false);
+                        .and_then(|id| state.downloaded.get(id).copied());
+                    let downloaded = version.is_some();
 
                     Row::new(vec![
                         format!(
@@ -835,7 +835,16 @@ fn ui<'t, 's, B: tui::backend::Backend>(
                             if downloaded { "✔" } else { " " },
                             metadata.title().unwrap_or("(No title)")
                         ),
-                        metadata.eprint().unwrap_or("").to_string(),
+                        metadata
+                            .eprint()
+                            .map(|eprint| {
+                                if let Some(version) = version {
+                                    format!("{}v{}", eprint, version)
+                                } else {
+                                    eprint.to_string()
+                                }
+                            })
+                            .unwrap_or_default(),
                         metadata.authors(),
                     ])
                     .style(if highlight {
