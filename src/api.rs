@@ -13,14 +13,25 @@ pub struct Hits {
 
 #[derive(Deserialize, Debug)]
 pub struct NestedHit {
+    pub created: String,
     pub metadata: Metadata,
+}
+
+impl NestedHit {
+    pub fn created_date(&self) -> Option<&str> {
+        self.created.split_once("T").map(|split| split.0)
+    }
 }
 
 #[derive(Deserialize, Debug)]
 pub struct Metadata {
+    pub control_number: u32,
+
     pub titles: Vec<Title>,
+
     #[serde(default)]
     pub arxiv_eprints: Vec<ArxivEprint>,
+
     #[serde(default)]
     pub authors: Vec<Author>,
 }

@@ -21,14 +21,14 @@ impl Cache {
             .connection
             .execute(
                 "CREATE TABLE IF NOT EXISTS eprints \
-                (id TEXT, version INT, \
+                (id TEXT NOT NULL, version INT NOT NULL, \
                     CONSTRAINT versions UNIQUE (id, version)\
                 )",
                 (),
             )
             .context("unable to create table")?;
 
-        if let Err(error) = self.try_migrate_v1().context("unable to migrate downloads") {
+        if let Err(error) = self.try_migrate_v2().context("unable to migrate downloads") {
             log::error!("{:?}", error);
         }
 
@@ -105,6 +105,36 @@ impl Cache {
         }
 
         tx.commit()?;
+
+        Ok(())
+    }
+
+    fn try_migrate_v2(&mut self) -> Result<()> {
+        let sql: String = self.connection.query_row(
+            "SELECT sql FROM sqlite_schema WHERE name = ? ",
+            ["eprints"],
+            |row| row.get(0),
+        )?;
+
+        if sql.contains("NOT NULL") {
+            return Ok(());
+        }
+
+        self.connection
+            .execute("ALTER TABLE eprints RENAME TO old_eprints", ())?;
+
+        self.connection.execute(
+            "CREATE TABLE IF NOT EXISTS eprints \
+                (id TEXT NOT NULL, version INT NOT NULL, \
+                    CONSTRAINT versions UNIQUE (id, version)\
+                )",
+            (),
+        )?;
+
+        self.connection
+            .execute("INSERT INTO eprints SELECT * FROM old_eprints", ())?;
+
+        self.connection.execute("DROP TABLE old_eprints", ())?;
 
         Ok(())
     }

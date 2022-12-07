@@ -33,12 +33,14 @@ use tui::{
 };
 
 use crate::{
-    api::{InspiresSearchResult, Metadata},
+    api::{InspiresSearchResult, Metadata, NestedHit},
     cache::Cache,
+    store::{Record, StoreConnection},
 };
 
 mod api;
 mod cache;
+mod store;
 
 fn main() -> anyhow::Result<()> {
     let data_dir = {
@@ -92,14 +94,21 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let connection = Connection::open({
-        let mut db = data_dir;
-        db.push("pneo.db");
-        db
-    })
-    .context("unable to create database")?;
+    let (cache_connection, store_connection) = {
+        let path = {
+            let mut db = data_dir;
+            db.push("pneo.db");
+            db
+        };
+        let get = || Connection::open(&path).context("unable to create database");
 
-    let mut cache = Cache::new(connection, preprint_dir);
+        (get()?, get()?)
+    };
+
+    let mut cache = Cache::new(cache_connection, preprint_dir);
+    let store = StoreConnection::start(store_connection);
+
+    store.execute(|store| store.init());
 
     cache.init().context("unable to initialize database")?;
 
@@ -120,10 +129,10 @@ fn main() -> anyhow::Result<()> {
         res => res,
     }?;
 
-    let assert = AssertUnwindSafe((&mut terminal, cache));
+    let assert = AssertUnwindSafe((&mut terminal, cache, store));
     let result = std::panic::catch_unwind(|| {
         let assert = assert;
-        main_loop(assert.0 .0, assert.0 .1)
+        main_loop(assert.0 .0, assert.0 .1, assert.0 .2)
     });
 
     fn stop_terminal(mut terminal: Terminal<CrosstermBackend<impl Write>>) -> io::Result<()> {
@@ -257,6 +266,7 @@ impl State {
 fn main_loop<B: tui::backend::Backend>(
     terminal: &mut Terminal<B>,
     cache: Cache,
+    store: StoreConnection,
 ) -> anyhow::Result<()> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_time()
@@ -568,10 +578,32 @@ fn main_loop<B: tui::backend::Backend>(
             Message::SearchResponse(res) => {
                 log::debug!("search response {:?}", res);
 
-                state.output = Some(
-                    res.map(|res| res.hits.hits.into_iter().map(|hit| hit.metadata).collect())
-                        .map(|entries| TableState::new(entries)),
-                );
+                let hits = res.map(|res| res.hits.hits);
+
+                let records = hits
+                    .as_ref()
+                    .into_iter()
+                    .flat_map(|entries: &Vec<NestedHit>| entries.iter())
+                    .filter_map(|hit| {
+                        Some(Record {
+                            control_number: hit.metadata.control_number,
+                            title: hit.metadata.title().unwrap_or("").to_string(),
+                            authors: hit
+                                .metadata
+                                .authors
+                                .iter()
+                                .filter_map(|au| au.last_name.clone())
+                                .collect(),
+                            created: hit.created_date()?.to_string(),
+                        })
+                    })
+                    .collect();
+
+                store.execute(|mut store| store.upsert(records));
+
+                state.output = Some(hits.map(|hits| {
+                    TableState::new(hits.into_iter().map(|hit| hit.metadata).collect())
+                }));
 
                 state.searching = false;
             }
