@@ -1114,6 +1114,7 @@ dependencies = [
  "env_logger",
  "futures",
  "log",
+ "once_cell",
  "quick-xml",
  "rusqlite",
  "serde",

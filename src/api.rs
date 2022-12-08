@@ -1,5 +1,8 @@
+use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use surf::http::Method;
+
+static CLIENT: Lazy<surf::Client> = Lazy::new(|| get_client());
 
 #[derive(Deserialize, Debug)]
 pub struct InspiresSearchResult {
@@ -97,7 +100,7 @@ struct ArxivQuery {
 }
 
 pub async fn search_inspires(input: String) -> Result<InspiresSearchResult, surf::Error> {
-    let mut response = surf::RequestBuilder::new(
+    let request_builder = surf::RequestBuilder::new(
         Method::Get,
         "https://inspirehep.net/api/literature".try_into().unwrap(),
     )
@@ -106,8 +109,9 @@ pub async fn search_inspires(input: String) -> Result<InspiresSearchResult, surf
         sort: "mostrecent",
         size: 50,
         fields: "titles,arxiv_eprints,authors",
-    })?
-    .await?;
+    })?;
+
+    let mut response = CLIENT.send(request_builder).await?;
 
     Ok(response.body_json::<InspiresSearchResult>().await?)
 }
@@ -130,13 +134,21 @@ pub struct Link {
 }
 
 pub async fn get_preprint(id: String) -> surf::Result<ArxivSearchResult> {
-    let mut response = surf::RequestBuilder::new(
+    let request_builder = surf::RequestBuilder::new(
         Method::Get,
         "http://export.arxiv.org/api/query".try_into().unwrap(),
     )
-    .query(&ArxivQuery { id_list: id })?
-    .await?;
+    .query(&ArxivQuery { id_list: id })?;
+
+    let mut response = CLIENT.send(request_builder).await?;
 
     let body = response.body_string().await?;
     Ok(quick_xml::de::from_str(&body)?)
+}
+
+fn get_client() -> surf::Client {
+    surf::Config::new()
+        .set_timeout(Some(std::time::Duration::from_secs(20)))
+        .try_into()
+        .unwrap()
 }
