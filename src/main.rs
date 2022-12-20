@@ -7,9 +7,10 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use futures::{
+    channel::mpsc::{self, UnboundedSender},
     future::{Fuse, FusedFuture},
     stream::{self, FusedStream},
-    Future, FutureExt, StreamExt, TryFutureExt,
+    AsyncBufReadExt, Future, FutureExt, StreamExt, TryFutureExt,
 };
 use rusqlite::Connection;
 use std::{
@@ -173,7 +174,8 @@ struct State {
     cursor: usize,
     output: Option<surf::Result<TableState<Metadata>>>,
     searching: bool,
-    fetching: bool,
+    /// (completed, total)
+    progress: Option<(usize, usize)>,
     warning: Option<String>,
     downloaded: HashMap<String, u8>,
 }
@@ -186,7 +188,7 @@ struct Hitbox {
 
 impl State {
     fn busy(&self) -> bool {
-        self.searching || self.fetching
+        self.searching || self.progress.is_some()
     }
 
     fn char_len(&self) -> usize {
@@ -293,7 +295,7 @@ fn main_loop<B: tui::backend::Backend>(
         cursor: 0,
         output: None,
         searching: false,
-        fetching: false,
+        progress: None,
         warning: None,
         downloaded: cache.get_downloaded()?,
     };
@@ -309,6 +311,7 @@ fn main_loop<B: tui::backend::Backend>(
     let mut redraw = false;
     let mut last_click = (std::time::UNIX_EPOCH, u16::MAX);
 
+    let (downloader, mut download_progress) = Downloader::new();
     let search_request = Fuse::terminated();
     let preprint_request = Fuse::terminated();
     let mut event_stream = EventStream::new().fuse();
@@ -332,6 +335,7 @@ fn main_loop<B: tui::backend::Backend>(
             Event(Option<io::Result<Event>>),
             SearchResponse(surf::Result<InspiresSearchResult>),
             Preprint(Result<()>),
+            DownloadProgress((usize, usize)),
             Spin,
             Commit,
         }
@@ -341,6 +345,7 @@ fn main_loop<B: tui::backend::Backend>(
             Event(Option<&'a Event>),
             SearchResponse(&'a surf::Result<InspiresSearchResult>),
             Preprint(&'a Result<()>),
+            DownloadProgress((usize, usize)),
             Spin,
             Commit,
         }
@@ -355,6 +360,7 @@ fn main_loop<B: tui::backend::Backend>(
                     Message::Preprint(res) => MessageDebug::Preprint(res),
                     Message::Spin => MessageDebug::Spin,
                     Message::Commit => MessageDebug::Commit,
+                    Message::DownloadProgress(p) => MessageDebug::DownloadProgress(*p),
                 }
             }
         }
@@ -375,6 +381,7 @@ fn main_loop<B: tui::backend::Backend>(
                 _ =  spin.next() => Message::Spin,
                 _ =  &mut throttle => Message::Commit,
                 preprint = &mut preprint_request => Message::Preprint(preprint),
+                progress = download_progress.next() => Message::DownloadProgress(progress.unwrap_or((0, 1))),
             }
         });
 
@@ -473,7 +480,7 @@ fn main_loop<B: tui::backend::Backend>(
                                 redraw = true;
                                 continue;
                             }
-                            if !state.fetching {
+                            if !state.progress.is_some() {
                                 state.append(ch);
                                 Some(Action::Input)
                             } else {
@@ -488,7 +495,7 @@ fn main_loop<B: tui::backend::Backend>(
                             }
                         }
                         KeyCode::Delete | KeyCode::Backspace => {
-                            if !state.fetching && state.delete() {
+                            if !state.progress.is_some() && state.delete() {
                                 Some(Action::Input)
                             } else {
                                 continue;
@@ -572,9 +579,11 @@ fn main_loop<B: tui::backend::Backend>(
                                 state.warning = Some(format!("{}", err));
                             }
                             Some(Ok(None)) => {
-                                state.fetching = true;
+                                state.progress = Some((0, 0));
                                 preprint_request.set(
-                                    download(preprint_id.unwrap().to_owned(), cache.clone()).fuse(),
+                                    downloader
+                                        .download(preprint_id.unwrap().to_owned(), cache.clone())
+                                        .fuse(),
                                 );
                             }
                             Some(Ok(Some(filename))) => {
@@ -631,7 +640,7 @@ fn main_loop<B: tui::backend::Backend>(
                 search_request.set(api::search_inspires(state.input.clone()).fuse());
             }
             Message::Preprint(res) => {
-                state.fetching = false;
+                state.progress = None;
                 let update = cache.get_downloaded().map_err(|e| e.to_string());
 
                 if let Err(err) = res {
@@ -646,6 +655,9 @@ fn main_loop<B: tui::backend::Backend>(
                         state.warning = Some(error);
                     }
                 }
+            }
+            Message::DownloadProgress(progress) => {
+                state.progress = state.progress.and(Some(progress));
             }
         }
     }
@@ -827,6 +839,38 @@ fn ui<'t, 's, B: tui::backend::Backend>(
         text_chunk.x -= 3;
         text_chunk.width = 4;
         f.render_widget(Block::default().title(spinner.icon()), text_chunk);
+
+        if let Some(progress) = state.progress.filter(|(_, total)| *total > 0) {
+            let progress_chunk = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([
+                    Constraint::Percentage(60),
+                    Constraint::Percentage(20),
+                    Constraint::Percentage(20),
+                ])
+                .split(input_chunk)[1];
+
+            f.render_widget(
+                Block::default()
+                    .border_type(tui::widgets::BorderType::Double)
+                    .borders(Borders::ALL),
+                progress_chunk,
+            );
+
+            let total = progress.0 as f32 / progress.1 as f32;
+
+            let width = ((progress_chunk.width - 2) as f32 * total).floor() as u16;
+
+            f.render_widget(
+                Block::default().style(Style::default().bg(Color::Green)),
+                Rect {
+                    x: progress_chunk.x + 1,
+                    y: progress_chunk.y + 1,
+                    width,
+                    height: 1,
+                },
+            )
+        }
 
         let message_chunk = Layout::default()
             .margin(1)
@@ -1027,51 +1071,89 @@ impl SpinnerState {
     }
 }
 
-async fn download(preprint_id: String, cache: Arc<Cache>) -> Result<()> {
-    log::info!("requesting preprint {}", &preprint_id);
+struct Downloader {
+    tx: UnboundedSender<(usize, usize)>,
+}
 
-    let preprint = api::get_preprint(preprint_id.to_string())
-        .await
-        .map_err(surf::Error::into_inner)
-        .context("error downloading preprint info")?;
+impl Downloader {
+    fn new() -> (Self, impl FusedStream<Item = (usize, usize)>) {
+        let (tx, rx) = mpsc::unbounded();
 
-    let entry = if preprint.entry.len() == 1 {
-        &preprint.entry[0]
-    } else {
-        anyhow::bail!("invalid preprint response {:?}", preprint)
-    };
+        (Self { tx }, rx)
+    }
 
-    let link = entry
-        .link
-        .iter()
-        .filter(|link| link.title.as_deref() == Some("pdf"))
-        .next();
+    async fn download(&self, preprint_id: String, cache: Arc<Cache>) -> Result<()> {
+        let preprint_id = preprint_id;
+        log::info!("requesting preprint {}", &preprint_id);
 
-    let Some(link) = link else {
-        anyhow::bail!("unable to find pdf link");
-    };
+        let preprint = api::get_preprint(preprint_id.to_string())
+            .await
+            .map_err(surf::Error::into_inner)
+            .context("error downloading preprint info")?;
 
-    let url = &link.href;
+        let entry = if preprint.entry.len() == 1 {
+            &preprint.entry[0]
+        } else {
+            anyhow::bail!("invalid preprint response {:?}", preprint)
+        };
 
-    log::info!("downloading {}", url);
+        let link = entry
+            .link
+            .iter()
+            .filter(|link| link.title.as_deref() == Some("pdf"))
+            .next();
 
-    let mut response = surf::Client::new()
-        .with(surf::middleware::Redirect::default())
-        .get(&url)
-        .map_err(surf::Error::into_inner)
-        .await
-        .context("error downloading pdf")?;
+        let Some(link) = link else {
+                anyhow::bail!("unable to find pdf link");
+            };
 
-    let bytes = response
-        .body_bytes()
-        .await
-        .map_err(surf::Error::into_inner)?;
+        let url = &link.href;
 
-    let path = cache
-        .insert(&entry.id, &preprint_id, &url, bytes)
-        .context("error saving preprint")?;
+        log::info!("downloading {}", url);
 
-    open_preprint(&path)
+        let mut response = surf::Client::new()
+            .with(surf::middleware::Redirect::default())
+            .get(&url)
+            .map_err(surf::Error::into_inner)
+            .await
+            .context("error downloading pdf")?;
+
+        let len = response
+            .header("content-length")
+            .map(|values| values.last().as_str())
+            .and_then(|val| usize::from_str_radix(val, 10).ok());
+
+        let bytes = if let Some(len) = len {
+            let _ = self.tx.unbounded_send((0, len));
+            let mut bytes = Vec::with_capacity(len);
+            let mut body = response.take_body();
+
+            loop {
+                let chunk = body.fill_buf().await?;
+                if chunk.is_empty() {
+                    break;
+                }
+                bytes.extend_from_slice(chunk);
+                let consumed = chunk.len();
+                drop(chunk);
+                body.consume_unpin(consumed);
+                let _ = self.tx.unbounded_send((bytes.len(), len));
+            }
+
+            bytes
+        } else {
+            response
+                .body_bytes()
+                .await
+                .map_err(surf::Error::into_inner)?
+        };
+
+        let path = cache
+            .insert(&entry.id, &preprint_id, &url, bytes)
+            .context("error saving preprint")?;
+
+        open_preprint(&path)
+    }
 }
 
 fn open_preprint(path: &Path) -> Result<()> {
