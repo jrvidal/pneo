@@ -189,18 +189,29 @@ impl State {
         self.searching || self.fetching
     }
 
+    fn char_len(&self) -> usize {
+        self.input.chars().count()
+    }
+
     fn append(&mut self, ch: char) {
-        if self.input.len() == self.cursor {
+        if self.char_len() == self.cursor {
             self.input.push(ch);
         } else {
-            self.input.insert(self.cursor, ch);
+            let pos = self
+                .input
+                .char_indices()
+                .skip(self.cursor)
+                .next()
+                .unwrap()
+                .0;
+            self.input.insert(pos, ch);
         }
 
         self.cursor += 1;
     }
 
     fn delete(&mut self) -> bool {
-        if self.input.len() == self.cursor {
+        if self.char_len() == self.cursor {
             if self.input.pop().is_some() {
                 self.cursor -= 1;
                 true
@@ -220,7 +231,7 @@ impl State {
         let cursor = if step < 0 {
             self.cursor.saturating_sub(1)
         } else {
-            (self.cursor + 1).min(self.input.len())
+            (self.cursor + 1).min(self.char_len())
         };
 
         self.cursor = cursor;
